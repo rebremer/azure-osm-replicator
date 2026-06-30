@@ -1,0 +1,42 @@
+# Local artifacts
+backup/
+old/
+old_serverless/
+*.tmp
+.tmp_*
+*.log
+whatif.txt
+
+# Compiled Bicep / ARM output
+infra/**/*.json
+!infra/**/*.bicepparam.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Secrets
+*.pem
+*.key
+.env
+*.bicepparam.local
+
+# Shell command logs — these typically contain real PG_ADMIN_PASSWORD,
+# subscription IDs, tenant IDs, and MSI client IDs copy-pasted from
+# live deploys. Never commit them.
+shell_commands.txt
+shell_*commands*.txt
+shell_*commands*
+
+# SSH keys for the VM
+osm-vm-key
+osm-vm-key.pub
+
+prompt.txt
+prompt.local.txt
+
+data/
