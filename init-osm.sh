@@ -220,23 +220,24 @@ fi
 # ──────────────────────────────────────────────
 
 # ─────────────────────────────────────────────
-# Step 1b: If the source PBF is not yet in blob storage, fetch it from
-# Geofabrik and stream it straight into the container. The byte stream
-# never touches local disk on the way in, so Defender for Storage
-# malware-scanning (if enabled on the account) sees the upload and
-# tags it before we read it back below.
+# Step 1b: Ensure the source PBF is present in blob storage.
 #
-# Skipped entirely if SKIP_DOWNLOAD=1 (caller asserts the blob already
-# exists at PBF_BLOB_PATH — typically a dated PBF for a catch-up demo).
-# Step 2 will then download that existing blob to PBF_LOCAL_PATH.
+# Always checks whether ${PBF_BLOB_PATH} exists in the container. If it
+# does, we reuse it. If it does not, we stream it from Geofabrik straight
+# into the container so it never touches local disk on the way in (which
+# lets Defender for Storage malware-scan the upload and tag it before
+# Step 2 reads it back).
+#
+# SKIP_DOWNLOAD=1 short-circuits the check — the caller asserts the
+# blob already exists (typically a dated PBF for a catch-up demo).
+# Step 2 will then download that existing blob to PBF_LOCAL_PATH; if it
+# is missing, azcopy will fail there.
 # ─────────────────────────────────────────────
-if [ "${SKIP_DOWNLOAD}" != "1" ]; then
-    echo ""
-    echo "=== Step 1b: Ensuring ${PBF_BLOB_PATH} exists in ${STORAGE_ACCOUNT}/${CONTAINER_NAME} ==="
+echo ""
+echo "=== Step 1b: Ensuring ${PBF_BLOB_PATH} exists in ${STORAGE_ACCOUNT}/${CONTAINER_NAME} ==="
+if [ "${SKIP_DOWNLOAD}" = "1" ]; then
+    echo "SKIP_DOWNLOAD=1 — caller asserts the blob already exists; not verifying."
 else
-    echo ""
-    echo "=== Step 1b: Skipping Geofabrik fetch (SKIP_DOWNLOAD=1) ==="
-    echo "Will use blob at ${PBF_BLOB_URL} as-is."
     # Blob HEAD via REST + IMDS token (no `az`, no ARM dependency).
     STORAGE_TOKEN=$(imds_token 'https://storage.azure.com/')
     if [ -z "${STORAGE_TOKEN}" ] || [ "${STORAGE_TOKEN}" = "null" ]; then

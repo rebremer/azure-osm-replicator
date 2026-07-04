@@ -1,0 +1,7 @@
+# Force LF line endings on all shell scripts so bash on WSL/Linux
+# doesn't choke on \r (which produces errors like
+# "set: pipefail: invalid option name").
+*.sh              text eol=lf
+*.bicep           text eol=lf
+*.bicepparam      text eol=lf
+cloud-init.yaml   text eol=lf

@@ -8,8 +8,10 @@ old_serverless/
 whatif.txt
 
 # Compiled Bicep / ARM output
-infra/**/*.json
-!infra/**/*.bicepparam.json
+infra-vnet/**/*.json
+infra-solution/**/*.json
+!infra-vnet/**/*.bicepparam.json
+!infra-solution/**/*.bicepparam.json
 
 # OS
 .DS_Store

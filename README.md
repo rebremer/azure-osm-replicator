@@ -7,9 +7,11 @@ backed by Azure Database for PostgreSQL Flexible Server.
 
 ## Quick start
 
-1. Provision storage, PG Flex Server, networking, and the import VM
-   ([infra/](infra/)) — `bash infra/deploy.sh` (set `DEPLOY_STORAGE=1
-   DEPLOY_PG=1` for greenfield).
+1. Provision networking, storage, PG Flex Server, and the import VM
+   ([infra-vnet/](infra-vnet/) then [infra-solution/](infra-solution/)) —
+   `bash infra-vnet/deploy-network.sh` then
+   `bash infra-solution/deploy.sh` (set `DEPLOY_STORAGE=1 DEPLOY_PG=1`
+   for greenfield storage + PG). See [Deploy](#deploy) below.
 2. On the PG Flex Server, run the four one-time prerequisites — see
    [Prerequisites](#prerequisites-one-time-on-the-pg-flex-server):
    create the target database, allow-list `postgis` + `hstore`, reset
@@ -33,28 +35,22 @@ For a full-planet build see [Scaling to planet](#scaling-to-planet).
 
 ## Architecture
 
+Two resource groups, one Azure region:
+
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  test-flosm-rg  (single Azure region)                                │
-│                                                                      │
-│  ┌──────────────────────────────────┐                                │
-│  │  osm-import-vm                   │                                │
-│  │  Ubuntu 24.04                    │                                │
-│  │  Standard_E32-8s_v5 (128 GB RAM) │                                │
-│  │                                  │                                │
-│  │  /mnt/data  ── 256 GiB Premium ──┼── nodes.bin  (~70 GB DE)       │
-│  │             SSD managed disk     │   germany-latest.osm.pbf       │
-│  │                                  │   per-iteration .osc.gz        │
-│  │  init-osm.sh / update-osm.sh     │                                │
-│  └──────┬───────────────────────────┘                                │
-│         │ libpq via private endpoint                                 │
-│         ▼                                                            │
-│  ┌──────────────────────┐    ┌───────────────────────────────────┐   │
-│  │ PE → PG Flex Server  │    │ PE → testpubliclandingzone        │   │
-│  │ test-database-pg     │    │ blob (Defender malware-scanned)   │   │
-│  │ D16ds_v5 / P30 / v17 │    │ container: osmscanning            │   │
-│  └──────────────────────┘    └───────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────────┘
+┌─ NETWORK_RG ─────────────┐   ┌─ CORE_RG ─────────────────────────────────────┐
+│  VNet + 2 subnets        │   │  osm-import-vm  (Ubuntu 24.04, E32-8s_v5)     │
+│    - vm-subnet           │◄──┤    /mnt/data → 256 GiB Premium SSD v2         │
+│    - pe-subnet           │   │    Standard Static PIP  (SSH-in, IPv4 egress) │
+│  NSGs (attached to subnets   │    UAMI  (KV read, Storage Blob Data Owner)   │
+│  but resource-defined in     │                                               │
+│  CORE_RG via cross-RG        │  Storage account  (blob, Defender-scanned)    │
+│  bicep module — day-2 you    │  PG Flex Server   (v17, D16ds_v5, P30)        │
+│  edit rules from CORE_RG)    │  Key Vault        (RBAC, PE-only, holds       │
+│                              │                    pg-admin-password)          │
+│                              │  Private endpoints:  blob, PG, KV             │
+│                              │  Private DNS zones + VNet links               │
+└──────────────────────────┘   └───────────────────────────────────────────────┘
 
 External:  Geofabrik replication server (HTTPS) — daily .osc.gz diffs
 ```
@@ -62,29 +58,70 @@ External:  Geofabrik replication server (HTTPS) — daily .osc.gz diffs
 - **One Linux VM** (`Standard_E32-8s_v5`) runs both the one-time initial
   import and the daily updater. Deallocated between runs; started a few
   minutes before each scheduled update.
-- **Azure Database for PostgreSQL Flexible Server** stores the rendered
-  geodata (`planet_osm_*` tables).
+- **PostgreSQL Flexible Server** (`Standard_D16ds_v5`, P30 storage,
+  publicNetworkAccess=Disabled) stores `planet_osm_*` tables.
 - **One Premium SSD managed disk on the VM** (`/mnt/data`) holds
   `nodes.bin` and per-iteration diffs. Survives deallocate/start.
-- All infra is captured in [infra/](infra/) Bicep.
+- **No NAT Gateway** (target env forbids it) and **no Bastion**. The
+  VM's Standard PIP provides deterministic IPv4 egress + SSH inbound.
+  In the end state a VNet-attached VPN retires the PIP
+  (`ENABLE_PUBLIC_IP=false`).
+- **Infra split:** [infra-vnet/](infra-vnet/) owns VNet + subnets and
+  writes NSGs cross-RG into `CORE_RG` so day-2 the solution owner needs
+  only Contributor on `CORE_RG` (+ subnet-join on `NETWORK_RG`).
+  [infra-solution/](infra-solution/) owns everything else (DNS zones,
+  PEs, VM, KV, and optionally storage + PG).
 
-## Deploy (see **TODO — Secrets** how to improve secrets mgnt)
+## Deploy
+
+**Two scripts, run once each.** All defaults are override-able via env vars
+(see [`infra-solution/main.bicepparam`](infra-solution/main.bicepparam)
+and [`infra-solution/deploy.sh`](infra-solution/deploy.sh) for the full list).
 
 ```bash
-export VM_ADMIN_PASSWORD='...'
-bash infra/deploy.sh                       # against existing storage + PG
+# ── 1. network foundation (once, needs Contributor on both RGs) ──
+export NETWORK_RG=test-osm-netwerk-rg
+export CORE_RG=test-osm-solution-rg
+export LOCATION=westus3
+bash infra-vnet/deploy-network.sh
 
-DEPLOY_STORAGE=1 DEPLOY_PG=1 \
-PG_ADMIN_PASSWORD='...' \
-bash infra/deploy.sh                       # full greenfield
+# ── 2. workload (storage + PG + VM + KV + PEs) ──
+export STORAGE_RG=$CORE_RG   PG_RG=$CORE_RG    # co-locate everything
+export STORAGE_ACCOUNT_NAME='mystorageacct'    # globally unique, 3-24 lowercase alnum
+export PG_SERVER_NAME='my-pg-01'               # globally unique DNS name
+export DEPLOY_STORAGE=1 DEPLOY_PG=1            # 0 to re-use existing
+export PG_ADMIN_PASSWORD='<pg password>'       # stored in KV, fetched by init-osm.sh
+export USE_SSH_KEY=true
+export SSH_PUBLIC_KEY="$(cat ~/osm-vm-key.pub)"
+# Test-env conveniences (skip for production):
+export KV_ENABLE_PURGE_PROTECTION=false        # so teardown can `az keyvault purge`
+export KV_NAME_PREFIX=osm-updater-kv2          # bump if a prior KV is soft-deleted
+bash ./infra-solution/deploy.sh
 ```
 
-Cloud-init in [infra/modules/cloud-init.yaml](infra/modules/cloud-init.yaml)
+The script prints the VM's public IP + `ssh` command at the end.
+`init-osm.sh` and `update-osm.sh` are pre-installed in the VM home
+directory by the CustomScript extension in
+[infra-solution/modules/vm.bicep](infra-solution/modules/vm.bicep),
+and `/etc/profile.d/osm-env.sh` exports every runtime variable
+(UAMI client ID, KV name, PG host, storage account, …) so a fresh
+SSH shell can just run `./init-osm.sh`.
+
+Cloud-init in [infra-solution/modules/cloud-init.yaml](infra-solution/modules/cloud-init.yaml)
 installs `osm2pgsql`, `azcopy`, `pyosmium`, `azure-cli`, `psql`, `jq`,
 then formats and mounts `/mnt/data`.
 
 `az deployment group what-if` confirms the deploy is idempotent
 (0 creates, 0 deletes against the existing RG).
+
+### Teardown
+
+```bash
+az group delete -n test-osm-solution-rg --yes --no-wait
+az group delete -n test-osm-netwerk-rg  --yes --no-wait
+# With KV_ENABLE_PURGE_PROTECTION=false the KV name is instantly reusable:
+az keyvault purge -n <the-kv-name-from-deploy> --location westus3
+```
 
 ## Run on the VM
 

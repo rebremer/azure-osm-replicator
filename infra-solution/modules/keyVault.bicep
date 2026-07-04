@@ -30,6 +30,9 @@ param publicNetworkAccess string = 'Disabled'
 @description('Create the Key Vault Secrets Officer role assignment for the VM identity. Set false when the deploying principal lacks Microsoft.Authorization/roleAssignments/write; assign the role manually afterwards.')
 param assignVmIdentityRole bool = true
 
+@description('Enable purge protection. Default true for ALZ compliance. Set false in throw-away test environments so `az keyvault purge` can reclaim the name immediately after a teardown — without this, the KV lingers in soft-deleted state for 7 days and blocks any redeploy that would otherwise reuse the same deterministic name.')
+param enablePurgeProtection bool = true
+
 // Built-in role: Key Vault Secrets Officer (read + write secrets)
 var kvSecretsOfficerRoleId = 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7'
 
@@ -45,7 +48,11 @@ resource kv 'Microsoft.KeyVault/vaults@2024-11-01' = {
     enableRbacAuthorization: true
     enableSoftDelete: true
     softDeleteRetentionInDays: 7
-    enablePurgeProtection: true
+    // Purge protection is IRREVERSIBLE once enabled — a KV with
+    // purgeProtection=true cannot be purged even by subscription
+    // Owners and lingers for the full soft-delete window after RG
+    // deletion. Keep it toggleable so test envs stay disposable.
+    enablePurgeProtection: enablePurgeProtection ? true : null
     publicNetworkAccess: publicNetworkAccess
     networkAcls: {
       defaultAction: publicNetworkAccess == 'Disabled' ? 'Deny' : 'Allow'

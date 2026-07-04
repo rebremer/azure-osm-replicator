@@ -1,17 +1,31 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// main.bicep — recreate the entire test-flosm-rg infrastructure for the
-// VM-based OSM updater.
+// main.bicep — workload stack for the VM-based OSM updater.
 //
-// What this deploys (in test-flosm-rg):
-//   - VNet (osm-updater-vnet) with 2 subnets + 2 NSGs
-//   - Private DNS zones for blob and PostgreSQL Flexible Server + vnet links
-//   - Private endpoints to an EXISTING storage account and an EXISTING
-//     PostgreSQL flexible server (these may live in other resource groups)
+// Assumes the network foundation (VNet + 2 subnets + NSGs + private DNS
+// zones) already exists and is passed in by resource ID. Deploy that
+// layer first via infra-vnet/network.bicep / deploy-network.sh.
+//
+// What this deploys (in CORE_RG):
 //   - Log Analytics workspace
-//   - User-assigned managed identity, public IP, NIC, data disk, VM
+//   - User-assigned managed identity, NIC + Standard PIP (default on),
+//     data disk, VM
+//   - Key Vault
+//   - Private endpoints (in the pre-existing PE subnet) to:
+//       * an EXISTING storage account
+//       * an EXISTING PostgreSQL flexible server
+//       * the Key Vault deployed here
+//     registered against the pre-existing private DNS zones
+//
+// No NAT Gateway and no Azure Bastion. The VM's Standard PIP provides
+// deterministic IPv4 outbound (and inbound SSH for bootstrap); the
+// end-state operator access path is a VNet-attached VPN gateway, at
+// which point ENABLE_PUBLIC_IP=false can retire the PIP.
 //
 // What this does NOT deploy (intentional):
-//   - The storage account itself (see storage.bicep — separate deployment)
+//   - VNet / subnets / NSGs / private DNS zones
+//     (see infra-vnet/network.bicep — deployed to its own RG,
+//     typically NETWORK_RG)
+//   - The storage account itself (see storage.bicep)
 //   - The PostgreSQL flexible server itself (see postgres.bicep)
 //   - Defender for Cloud auto-created resources (JIT NSG rules, MDE.Linux
 //     extension on the VM, Defender malware-scan tagging) — these appear
@@ -53,11 +67,20 @@ param postgresServerResourceId string
 @allowed([ '1', '2', '3' ])
 param availabilityZone string = '1'
 
-@description('Key Vault name prefix. A subscription/RG-stable 6-char suffix is appended to keep the final name globally unique. Final name length must stay <= 24.')
-param keyVaultName string = 'osm-updater-kv'
+@description('Key Vault name prefix. A subscription/RG-stable 6-char suffix is appended to keep the final name globally unique. Final name length must stay <= 24. Bump the prefix (e.g. -kv2, -kv3) whenever a previously-deployed KV with `enablePurgeProtection=true` lingers in soft-deleted state and blocks re-use of the same deterministic name.')
+param keyVaultName string = 'osm-updater-kv2'
 
 @description('Secret name for the PostgreSQL admin password in Key Vault.')
 param pgPasswordSecretName string = 'pg-admin-password'
+
+@description('PostgreSQL admin login. Threaded into /etc/profile.d/osm-env.sh on the VM as PGUSER.')
+param pgAdminLogin string = 'bremerov'
+
+@description('PostgreSQL database used by init-osm.sh / update-osm.sh. Threaded into /etc/profile.d/osm-env.sh as PGDATABASE.')
+param pgDatabaseName string = 'osm'
+
+@description('Blob container used for the PBF source / diff staging. Threaded into /etc/profile.d/osm-env.sh as CONTAINER_NAME.')
+param containerName string = 'osmscanning'
 
 @description('Public network access for the Key Vault. Default Disabled to satisfy ALZ Deny-PublicPaaSEndpoints; the secret is written from the VM (inside the VNet) post-deploy by deploy.sh.')
 @allowed([ 'Enabled', 'Disabled' ])
@@ -66,49 +89,44 @@ param keyVaultPublicNetworkAccess string = 'Disabled'
 @description('Create the Key Vault Secrets Officer role assignment for the VM identity. Set false when the deploying principal lacks Microsoft.Authorization/roleAssignments/write; assign the role manually afterwards.')
 param assignVmIdentityKvRole bool = true
 
-@description('Attach a public IP to the VM NIC. Default false to satisfy ALZ Deny-Public-IP-On-NIC. Operators reach the VM via Azure Bastion (see enableBastion).')
-param enablePublicIp bool = false
+@description('Enable Key Vault purge protection. Default true for ALZ compliance. Set false in disposable test environments so a deleted KV can be purged immediately (otherwise it blocks the same-name redeploy for 7 days).')
+param keyVaultEnablePurgeProtection bool = true
 
-@description('Deploy an Azure Bastion host (Standard SKU, with native-client tunneling) so operators can SSH/SCP to the VM without a public IP. Adds ~$140/mo.')
-param enableBastion bool = true
-
-@description('Deploy a NAT Gateway + Standard Static PIP and attach it to vm-subnet for deterministic IPv4 egress. Default true. Disable only if outbound is handled by an upstream firewall/UDR.')
-param enableNatGateway bool = true
+@description('Attach a Standard Static Public IP to the VM NIC. Default true — needed for SSH-in and deterministic IPv4 egress since this stack has no NAT Gateway and no Bastion. Set false once a VPN/ExpressRoute is wired into the VNet.')
+param enablePublicIp bool = true
 
 // ──────────────────────────────────────────────
-// NAT Gateway (deployed before the vnet so the subnet PUT carries the
-// association on first deploy and we avoid a separate subnet PATCH).
+// Pre-existing network resources (deployed by infra-vnet/network.bicep
+// into NETWORK_RG). Script 1 exports the VNet + subnet IDs; script 2
+// (deploy.sh) threads them through main.bicepparam.
+//
+// DNS zones live HERE (CORE_RG) — they are created below, not passed
+// in. This lets the solution owner manage DNS records day-2 with
+// Contributor on CORE_RG only, no rights on NETWORK_RG.
 // ──────────────────────────────────────────────
-module natGw 'modules/natGateway.bicep' = if (enableNatGateway) {
-  name: 'nat-gateway'
-  params: {
-    name: '${prefix}-natgw'
-    location: location
-    availabilityZone: availabilityZone
-  }
-}
+@description('Resource ID of the pre-existing VNet (from network.bicep output vnetId). Used as the target of the private DNS zone links created here.')
+param vnetResourceId string
+
+@description('Resource ID of the pre-existing private-endpoint subnet.')
+param peSubnetId string
+
+@description('Resource ID of the pre-existing VM subnet.')
+param vmSubnetId string
 
 // ──────────────────────────────────────────────
-// Network: vnet + subnets + NSGs
+// Private DNS zones + VNet links — all created in CORE_RG (this RG).
+// Each link only needs read on the target VNet, not write, so the
+// solution owner can create/manage them without Contributor on
+// NETWORK_RG.
 // ──────────────────────────────────────────────
-module net 'modules/network.bicep' = {
-  name: 'network'
-  params: {
-    prefix: prefix
-    location: location
-    natGatewayId: enableNatGateway ? natGw!.outputs.natGatewayId : ''
-  }
-}
+var vnetLinkName = 'osm-updater-vnet-link'
 
-// ──────────────────────────────────────────────
-// Private DNS zones + vnet links
-// ──────────────────────────────────────────────
 module dnsBlob 'modules/privateDnsZone.bicep' = {
   name: 'dns-blob'
   params: {
     zoneName: 'privatelink.blob.${environment().suffixes.storage}'
-    vnetId: net.outputs.vnetId
-    linkName: '${net.outputs.vnetName}-link'
+    vnetId: vnetResourceId
+    linkName: vnetLinkName
   }
 }
 
@@ -116,8 +134,8 @@ module dnsPg 'modules/privateDnsZone.bicep' = {
   name: 'dns-pg'
   params: {
     zoneName: 'privatelink.postgres.database.azure.com'
-    vnetId: net.outputs.vnetId
-    linkName: '${net.outputs.vnetName}-pg-link'
+    vnetId: vnetResourceId
+    linkName: vnetLinkName
   }
 }
 
@@ -125,8 +143,8 @@ module dnsKv 'modules/privateDnsZone.bicep' = {
   name: 'dns-kv'
   params: {
     zoneName: 'privatelink.vaultcore.azure.net'
-    vnetId: net.outputs.vnetId
-    linkName: '${net.outputs.vnetName}-kv-link'
+    vnetId: vnetResourceId
+    linkName: vnetLinkName
   }
 }
 
@@ -135,13 +153,20 @@ module dnsKv 'modules/privateDnsZone.bicep' = {
 // ──────────────────────────────────────────────
 var storageAccountName = last(split(storageAccountResourceId, '/'))
 var pgServerName = last(split(postgresServerResourceId, '/'))
+var pgServerFqdn = '${pgServerName}.postgres.database.azure.com'
+
+// KV name is computed once here (deterministic 6-char suffix from
+// sub+RG uniqueString) so it can be baked into /etc/profile.d/osm-env.sh
+// on the VM BEFORE the KV module runs. Otherwise the VM module would
+// depend on the KV module which depends on the VM identity → cycle.
+var keyVaultFullName = '${keyVaultName}-${substring(uniqueString(subscription().subscriptionId, resourceGroup().id), 0, 6)}'
 
 module peBlob 'modules/privateEndpoint.bicep' = {
   name: 'pe-blob'
   params: {
     name: '${storageAccountName}-blob-pe'
     location: location
-    subnetId: net.outputs.peSubnetId
+    subnetId: peSubnetId
     targetResourceId: storageAccountResourceId
     groupId: 'blob'
     privateDnsZoneId: dnsBlob.outputs.zoneId
@@ -153,7 +178,7 @@ module pePg 'modules/privateEndpoint.bicep' = {
   params: {
     name: '${pgServerName}-pg-pe'
     location: location
-    subnetId: net.outputs.peSubnetId
+    subnetId: peSubnetId
     targetResourceId: postgresServerResourceId
     groupId: 'postgresqlServer'
     privateDnsZoneId: dnsPg.outputs.zoneId
@@ -183,19 +208,17 @@ module vm 'modules/vm.bicep' = {
     adminPassword: adminPassword
     useSshKey: useSshKey
     sshPublicKey: sshPublicKey
-    subnetId: net.outputs.vmSubnetId
+    subnetId: vmSubnetId
     availabilityZone: availabilityZone
     enablePublicIp: enablePublicIp
-  }
-}
-
-// Azure Bastion for SSH access when the VM has no public IP.
-module bastion 'modules/bastion.bicep' = if (enableBastion) {
-  name: 'bastion'
-  params: {
-    name: '${prefix}-bastion'
-    location: location
-    bastionSubnetId: net.outputs.bastionSubnetId
+    // Values baked into /etc/profile.d/osm-env.sh on the VM.
+    keyVaultName: keyVaultFullName
+    pgPasswordSecretName: pgPasswordSecretName
+    pgServerFqdn: pgServerFqdn
+    pgAdminLogin: pgAdminLogin
+    pgDatabaseName: pgDatabaseName
+    storageAccountName: storageAccountName
+    containerName: containerName
   }
 }
 
@@ -206,14 +229,15 @@ module bastion 'modules/bastion.bicep' = if (enableBastion) {
 module kv 'modules/keyVault.bicep' = {
   name: 'keyvault'
   params: {
-    // 6-char deterministic suffix derived from subscription + RG so
-    // the name is stable across redeploys but unique per environment.
-    name: '${keyVaultName}-${substring(uniqueString(subscription().subscriptionId, resourceGroup().id), 0, 6)}'
+    // Reuses the deterministic name hoisted above so the same value
+    // is baked into the VM's /etc/profile.d/osm-env.sh.
+    name: keyVaultFullName
     location: location
     vmIdentityPrincipalId: vm.outputs.managedIdentityPrincipalId
     pgPasswordSecretName: pgPasswordSecretName
     publicNetworkAccess: keyVaultPublicNetworkAccess
     assignVmIdentityRole: assignVmIdentityKvRole
+    enablePurgeProtection: keyVaultEnablePurgeProtection
   }
 }
 
@@ -227,21 +251,23 @@ module peKv 'modules/privateEndpoint.bicep' = {
   params: {
     name: '${kv.outputs.keyVaultName}-pe'
     location: location
-    subnetId: net.outputs.peSubnetId
+    subnetId: peSubnetId
     targetResourceId: kv.outputs.keyVaultId
     groupId: 'vault'
     privateDnsZoneId: dnsKv.outputs.zoneId
   }
 }
 
+output vnetResourceId string = vnetResourceId
 output vmPublicIp string = vm.outputs.publicIp
 output vmPrivateIp string = vm.outputs.privateIp
 output vmName string = vm.outputs.vmName
-output bastionName string = enableBastion ? bastion!.outputs.bastionName : ''
 output managedIdentityClientId string = vm.outputs.managedIdentityClientId
 output managedIdentityPrincipalId string = vm.outputs.managedIdentityPrincipalId
 output logAnalyticsCustomerId string = logs.outputs.customerId
 output keyVaultName string = kv.outputs.keyVaultName
 output keyVaultUri string = kv.outputs.keyVaultUri
 output pgSecretName string = kv.outputs.pgSecretName
-output natGatewaySnatIp string = enableNatGateway ? natGw!.outputs.snatPublicIp : ''
+output dnsBlobZoneId string = dnsBlob.outputs.zoneId
+output dnsPgZoneId string = dnsPg.outputs.zoneId
+output dnsKvZoneId string = dnsKv.outputs.zoneId

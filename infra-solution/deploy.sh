@@ -1,22 +1,34 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# deploy.sh — end-to-end deployment of the OSM updater stack.
+# deploy.sh — workload stack for the OSM updater.
+#
+# PREREQUISITE: run infra-vnet/deploy-network.sh first (or point NETWORK_RG
+# at an existing network RG whose latest osm-network-* deployment
+# exports the resource IDs consumed here). Alternatively export the
+# 3 VNET_/PE_/VM_ subnet ID env vars yourself to attach to a
+# pre-existing VNet you own. Private DNS zones are created HERE in
+# CORE_RG, not consumed from NETWORK_RG.
 #
 # Order:
+#   0. Resolve pre-existing network IDs (VNet + subnets + DNS zones)
 #   1. (Optional) Storage account              → STORAGE_RG
 #   2. (Optional) PostgreSQL Flexible Server   → PG_RG
-#   3. VM stack (vnet + PEs + VM + identity)   → CORE_RG
+#   3. Workload stack (PEs + VM + KV + identity) → CORE_RG
 #   4. Storage Blob Data Owner role on the
 #      storage account for the VM identity     → STORAGE_RG
 #
-# Steps 1 and 2 are guarded by DEPLOY_STORAGE / DEPLOY_PG so you can re-run
-# step 3+4 on existing storage / PG (the production case).
+# Steps 1 and 2 are guarded by DEPLOY_STORAGE / DEPLOY_PG so you can
+# re-run step 3+4 on existing storage / PG (the production case).
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 # ── Resource groups ──
 CORE_RG="${CORE_RG:-test-flosm-rg}"
 CORE_LOCATION="${CORE_LOCATION:-westus3}"
+# Network RG holds the VNet + subnets + NAT GW + private DNS zones
+# (deployed by deploy-network.sh). When set, this script auto-discovers
+# the resource IDs from its latest osm-network-* deployment.
+NETWORK_RG="${NETWORK_RG:-test-network-rg}"
 # When deploying greenfield into a single RG, set STORAGE_RG=PG_RG=CORE_RG.
 STORAGE_RG="${STORAGE_RG:-test-lakehouse-rg}"
 PG_RG="${PG_RG:-test-database-rg}"
@@ -57,11 +69,50 @@ SBDO_ROLE_ID='b7e6dc6d-f1e8-4753-8033-0f276bb0955b'
 
 echo "=== deploy.sh ==="
 echo "Core RG:       ${CORE_RG} (${CORE_LOCATION})"
+echo "Network RG:    ${NETWORK_RG}"
 echo "Storage RG:    ${STORAGE_RG}  (deploy=${DEPLOY_STORAGE})"
 echo "PG RG:         ${PG_RG}       (deploy=${DEPLOY_PG})"
 
 # Make sure the core RG exists.
 az group create -n "${CORE_RG}" -l "${CORE_LOCATION}" --output none
+
+# ── Step 0: resolve pre-existing network resource IDs ──
+# Priority:
+#   1. If VNET_RESOURCE_ID is already set, trust the caller and require
+#      the subnet IDs to be present (BYO existing VNet).
+#   2. Otherwise, discover the latest osm-network-* deployment in
+#      NETWORK_RG and pull the outputs.
+if [ -z "${VNET_RESOURCE_ID:-}" ]; then
+    echo ""
+    echo "=== Step 0: discovering network IDs from ${NETWORK_RG} ==="
+    NET_DEPLOY=$(az deployment group list -g "${NETWORK_RG}" \
+        --query "[?starts_with(name, 'osm-network-')] | sort_by(@, &properties.timestamp) | [-1].name" \
+        -o tsv 2>/dev/null || true)
+    if [ -z "${NET_DEPLOY}" ]; then
+        echo "ERROR: no osm-network-* deployment found in ${NETWORK_RG}." >&2
+        echo "       Run infra-vnet/deploy-network.sh first, or export VNET_RESOURCE_ID" >&2
+        echo "       + PE_SUBNET_ID + VM_SUBNET_ID to point at an existing VNet." >&2
+        exit 1
+    fi
+    echo "Reading outputs from: ${NET_DEPLOY}"
+    read_net_out() {
+        az deployment group show -g "${NETWORK_RG}" -n "${NET_DEPLOY}" \
+            --query "properties.outputs.$1.value" -o tsv
+    }
+    VNET_RESOURCE_ID=$(read_net_out vnetId)
+    PE_SUBNET_ID=$(read_net_out peSubnetId)
+    VM_SUBNET_ID=$(read_net_out vmSubnetId)
+fi
+
+: "${VNET_RESOURCE_ID:?Set VNET_RESOURCE_ID (or run deploy-network.sh first).}"
+: "${PE_SUBNET_ID:?Set PE_SUBNET_ID}"
+: "${VM_SUBNET_ID:?Set VM_SUBNET_ID}"
+
+export VNET_RESOURCE_ID PE_SUBNET_ID VM_SUBNET_ID
+
+echo "  VNET_RESOURCE_ID = ${VNET_RESOURCE_ID}"
+echo "  PE_SUBNET_ID     = ${PE_SUBNET_ID}"
+echo "  VM_SUBNET_ID     = ${VM_SUBNET_ID}"
 
 # ── Step 1: storage account (optional) ──
 if [ "${DEPLOY_STORAGE}" = "1" ]; then
@@ -71,8 +122,8 @@ if [ "${DEPLOY_STORAGE}" = "1" ]; then
     az deployment group create \
         --resource-group "${STORAGE_RG}" \
         --name "osm-storage-$(date +%Y%m%d-%H%M%S)" \
-        --template-file infra/storage.bicep \
-        --parameters infra/storage.bicepparam \
+        --template-file infra-solution/storage.bicep \
+        --parameters infra-solution/storage.bicepparam \
         --output none
 fi
 
@@ -85,14 +136,14 @@ if [ "${DEPLOY_PG}" = "1" ]; then
     az deployment group create \
         --resource-group "${PG_RG}" \
         --name "osm-pg-$(date +%Y%m%d-%H%M%S)" \
-        --template-file infra/postgres.bicep \
-        --parameters infra/postgres.bicepparam \
+        --template-file infra-solution/postgres.bicep \
+        --parameters infra-solution/postgres.bicepparam \
         --output none
 fi
 
-# ── Step 3: core VM stack ──
+# ── Step 3: workload stack (PEs + VM + KV) ──
 echo ""
-echo "=== Step 3: core VM stack ==="
+echo "=== Step 3: workload stack (PEs + VM + KV) ==="
 # Normalize ASSIGN_ROLES (default 1/true). 0/false skips both the KV
 # role assignment (in main.bicep) and the storage role assignment (in
 # Step 4) — use when the deploying principal lacks
@@ -109,12 +160,13 @@ USE_SSH_KEY="${USE_SSH_KEY}" \
 SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY}" \
 VM_ADMIN_PASSWORD="${VM_ADMIN_PASSWORD}" \
 KV_PUBLIC_NETWORK_ACCESS="${KV_PUBLIC_NETWORK_ACCESS:-Disabled}" \
+ENABLE_PUBLIC_IP="${ENABLE_PUBLIC_IP:-true}" \
 ASSIGN_ROLES="${ASSIGN_ROLES_BICEP}" \
 az deployment group create \
     --resource-group "${CORE_RG}" \
     --name "${DEPLOY_NAME}" \
-    --template-file infra/main.bicep \
-    --parameters infra/main.bicepparam \
+    --template-file infra-solution/main.bicep \
+    --parameters infra-solution/main.bicepparam \
     --output none
 
 # Pull outputs we need for the role assignment.
@@ -128,8 +180,6 @@ VM_PRIVATE_IP=$(az deployment group show -g "${CORE_RG}" -n "${DEPLOY_NAME}" \
     --query "properties.outputs.vmPrivateIp.value" -o tsv)
 VM_NAME_OUT=$(az deployment group show -g "${CORE_RG}" -n "${DEPLOY_NAME}" \
     --query "properties.outputs.vmName.value" -o tsv)
-BASTION_NAME=$(az deployment group show -g "${CORE_RG}" -n "${DEPLOY_NAME}" \
-    --query "properties.outputs.bastionName.value" -o tsv)
 KV_NAME=$(az deployment group show -g "${CORE_RG}" -n "${DEPLOY_NAME}" \
     --query "properties.outputs.keyVaultName.value" -o tsv)
 KV_URI=$(az deployment group show -g "${CORE_RG}" -n "${DEPLOY_NAME}" \
@@ -145,7 +195,7 @@ if [ "${ASSIGN_ROLES}" = "1" ]; then
     az deployment group create \
         --resource-group "${STORAGE_RG}" \
         --name "osm-storage-ra-$(date +%Y%m%d-%H%M%S)" \
-        --template-file infra/modules/storageRoleAssignment.bicep \
+        --template-file infra-solution/modules/storageRoleAssignment.bicep \
         --parameters \
             storageAccountName="${STORAGE_ACCOUNT_NAME}" \
             principalId="${MI_PRINCIPAL_ID}" \
@@ -161,12 +211,11 @@ else
 fi
 
 # ── Step 5: write PG password into Key Vault from inside the VM ──
-# KV has publicNetworkAccess=Disabled (ALZ policy), and the VM has no
-# public IP (ALZ Deny-Public-IP-On-NIC). We use `az vm run-command
-# invoke` which goes through the ARM control plane (no inbound network
-# needed) to run a small script on the VM. The VM has the Secrets
-# Officer role on the KV, so it can PUT the secret via IMDS+curl over
-# the private endpoint.
+# KV has publicNetworkAccess=Disabled (ALZ policy). Whether or not the
+# VM has a public IP, `az vm run-command invoke` goes through the ARM
+# control plane (no inbound network needed) to run a small script on
+# the VM. The VM has the Secrets Officer role on the KV, so it can PUT
+# the secret via IMDS+curl over the KV private endpoint.
 echo ""
 echo "=== Step 5: writing ${PG_SECRET_NAME} to ${KV_NAME} via az vm run-command ==="
 
@@ -186,7 +235,9 @@ PG_SECRET_EXP_DAYS="${PG_SECRET_EXP_DAYS:-90}"
 PG_SECRET_CONTENT_TYPE="${PG_SECRET_CONTENT_TYPE:-text/plain}"
 PG_SECRET_EXP_UNIX=$(date -u -d "+${PG_SECRET_EXP_DAYS} days" +%s)
 REMOTE_SCRIPT=$(cat <<EOS
-set -euo pipefail
+# az vm run-command RunShellScript executes via /bin/sh (dash on
+# Ubuntu), which does NOT support 'set -o pipefail'. Stick to POSIX.
+set -eu
 TOKEN=\$(curl -sS -H Metadata:true \
   "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net&client_id=${MI_CLIENT_ID}" \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
@@ -206,18 +257,39 @@ echo "Secret ${PG_SECRET_NAME} written to ${KV_NAME}."
 EOS
 )
 
-az vm run-command invoke \
-    --resource-group "${CORE_RG}" \
-    --name "${VM_NAME_OUT:-osm-import-vm}" \
-    --command-id RunShellScript \
-    --scripts "${REMOTE_SCRIPT}" \
-    --query "value[0].message" -o tsv
+# `az vm run-command invoke` returns exit 0 even when the inner script
+# exit 1'd — we have to parse the message ourselves. Also retry a few
+# times because the KV Secrets Officer role assignment can take
+# 30–90s to propagate globally after deploy Step 3.
+KV_PUSH_ATTEMPT=1
+KV_PUSH_MAX=5
+KV_PUSH_OK=0
+while [ "${KV_PUSH_ATTEMPT}" -le "${KV_PUSH_MAX}" ]; do
+    KV_PUSH_MSG=$(az vm run-command invoke \
+        --resource-group "${CORE_RG}" \
+        --name "${VM_NAME_OUT:-osm-import-vm}" \
+        --command-id RunShellScript \
+        --scripts "${REMOTE_SCRIPT}" \
+        --query "value[0].message" -o tsv 2>&1 || true)
+    printf '%s\n' "${KV_PUSH_MSG}"
+    if printf '%s' "${KV_PUSH_MSG}" | grep -q "Secret ${PG_SECRET_NAME} written to ${KV_NAME}."; then
+        KV_PUSH_OK=1
+        break
+    fi
+    echo "  attempt ${KV_PUSH_ATTEMPT}/${KV_PUSH_MAX} did not confirm success; retrying in 20s (likely RBAC propagation)..."
+    KV_PUSH_ATTEMPT=$((KV_PUSH_ATTEMPT + 1))
+    sleep 20
+done
+if [ "${KV_PUSH_OK}" != "1" ]; then
+    echo "ERROR: failed to write ${PG_SECRET_NAME} to ${KV_NAME} after ${KV_PUSH_MAX} attempts." >&2
+    echo "       See the messages above for the HTTP status returned by KV." >&2
+    exit 1
+fi
 
 echo ""
 echo "=== Done ==="
 echo "VM private IP:                 ${VM_PRIVATE_IP}"
-echo "VM public IP:                  ${VM_PIP:-<none — use Bastion>}"
-echo "Bastion host:                  ${BASTION_NAME:-<not deployed>}"
+echo "VM public IP:                  ${VM_PIP:-<none — reach VM via VPN over the VNet>}"
 echo "Managed identity client id:    ${MI_CLIENT_ID}"
 echo "Managed identity principal id: ${MI_PRINCIPAL_ID}"
 echo "Key Vault:                     ${KV_NAME} (${KV_URI})"
@@ -225,46 +297,36 @@ echo "PG password secret:            ${PG_SECRET_NAME}"
 echo ""
 SSH_USER="${SSH_USER:-osmadmin}"
 PG_FQDN="${PG_SERVER_NAME}.postgres.database.azure.com"
-VM_ID=$(az vm show -g "${CORE_RG}" -n "${VM_NAME_OUT:-osm-import-vm}" --query id -o tsv)
 
-if [ -n "${BASTION_NAME}" ]; then
+if [ -n "${VM_PIP}" ]; then
 cat <<EOF
-── Reach the VM via Bastion (Standard SKU, native client) ──────
-# One-off SSH (requires Az CLI + 'bastion' extension, az network bastion):
-az network bastion ssh \\
-    --name '${BASTION_NAME}' --resource-group '${CORE_RG}' \\
-    --target-resource-id '${VM_ID}' \\
-    --auth-type ssh-key --username '${SSH_USER}' --ssh-key ./osm-vm-key
+── Reach the VM over its public IP (default; ENABLE_PUBLIC_IP=true) ──
+# init-osm.sh and update-osm.sh are already installed in ~${SSH_USER}
+# by the CustomScript extension on the VM (see infra-solution/modules/vm.bicep).
 
-# Copy init/update scripts to the VM through a Bastion tunnel:
-az network bastion tunnel \\
-    --name '${BASTION_NAME}' --resource-group '${CORE_RG}' \\
-    --target-resource-id '${VM_ID}' \\
-    --resource-port 22 --port 2222 &
-TUNNEL_PID=\$!
-sleep 5
-scp -i ./osm-vm-key -P 2222 -o StrictHostKeyChecking=no \\
-    ./init-osm.sh ./update-osm.sh ${SSH_USER}@127.0.0.1:~/
-kill \$TUNNEL_PID
+ssh -i ~/osm-vm-key ${SSH_USER}@${VM_PIP}
 EOF
 else
 cat <<EOF
-── No Bastion deployed; reach the VM over your VNet (peering/VPN) ──
-ssh -i ./osm-vm-key ${SSH_USER}@${VM_PRIVATE_IP}
+── No public IP; reach the VM over your VNet (VPN / peering) ──
+ssh -i ~/osm-vm-key ${SSH_USER}@${VM_PRIVATE_IP}
 EOF
 fi
 
 cat <<EOF
 
 ── Run on the VM ──────────────────────────────────────────────
-export UAI_CLIENT_ID='${MI_CLIENT_ID}'
-export KEY_VAULT_NAME='${KV_NAME}'
-export PG_PASSWORD_SECRET_NAME='${PG_SECRET_NAME}'
-export PGHOST='${PG_FQDN}'
-export PGUSER='${PG_ADMIN_LOGIN:-bremerov}'
-export PGDATABASE='osm'
-export STORAGE_ACCOUNT='${STORAGE_ACCOUNT_NAME}'
-export CONTAINER_NAME='osmscanning'
+# The VM's /etc/profile.d/osm-env.sh (written by the CustomScript
+# extension in infra-solution/modules/vm.bicep) already exports:
+#   UAI_CLIENT_ID=${MI_CLIENT_ID}
+#   KEY_VAULT_NAME=${KV_NAME}
+#   PG_PASSWORD_SECRET_NAME=${PG_SECRET_NAME}
+#   PGHOST=${PG_FQDN}
+#   PGUSER=${PG_ADMIN_LOGIN:-bremerov}
+#   PGDATABASE=osm
+#   STORAGE_ACCOUNT=${STORAGE_ACCOUNT_NAME}
+#   CONTAINER_NAME=osmscanning
+# so a fresh SSH shell can just run:
 
 ./init-osm.sh
 # then on a timer: ./update-osm.sh
