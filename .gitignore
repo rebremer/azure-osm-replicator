@@ -27,6 +27,17 @@ Thumbs.db
 .env
 *.bicepparam.local
 
+# Terraform — state files contain plaintext credentials (storage account
+# keys, PG admin passwords, etc.). Provider binaries + lock caches also
+# never belong in git.
+**/terraform.tfstate
+**/terraform.tfstate.*
+**/.terraform/
+**/.terraform.lock.hcl
+**/crash.log
+**/tf.log
+*.tfvars.local
+
 # Shell command logs — these typically contain real PG_ADMIN_PASSWORD,
 # subscription IDs, tenant IDs, and MSI client IDs copy-pasted from
 # live deploys. Never commit them.
@@ -42,3 +53,8 @@ prompt.txt
 prompt.local.txt
 
 data/
+
+# Local perf-testing / one-off scripts that may contain hardcoded
+# tenant/subscription/VM IPs or paths specific to the operator.
+perf-*.sh
+perf-*/

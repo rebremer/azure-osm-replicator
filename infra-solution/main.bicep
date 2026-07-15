@@ -74,7 +74,7 @@ param keyVaultName string = 'osm-updater-kv2'
 param pgPasswordSecretName string = 'pg-admin-password'
 
 @description('PostgreSQL admin login. Threaded into /etc/profile.d/osm-env.sh on the VM as PGUSER.')
-param pgAdminLogin string = 'bremerov'
+param pgAdminLogin string = 'osmuser'
 
 @description('PostgreSQL database used by init-osm.sh / update-osm.sh. Threaded into /etc/profile.d/osm-env.sh as PGDATABASE.')
 param pgDatabaseName string = 'osm'

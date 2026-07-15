@@ -1,9 +1,12 @@
 # azure-osm-replicator
 
 Azure reference implementation for keeping a planet-scale OpenStreetMap
-PostGIS database current via daily Geofabrik / OSM replication diffs,
-using `osm2pgsql --append --slim --flat-nodes` on a scheduled Linux VM
-backed by Azure Database for PostgreSQL Flexible Server.
+PostGIS database current via daily OSM replication diffs (default source:
+[planet.openstreetmap.org](https://planet.openstreetmap.org/), with
+[Geofabrik](https://download.geofabrik.de/) regional extracts as the
+drop-in alternative), using `osm2pgsql --append --slim --flat-nodes` on
+a scheduled Linux VM backed by Azure Database for PostgreSQL Flexible
+Server.
 
 ## Quick start
 
@@ -52,7 +55,9 @@ Two resource groups, one Azure region:
 │                              │  Private DNS zones + VNet links               │
 └──────────────────────────┘   └───────────────────────────────────────────────┘
 
-External:  Geofabrik replication server (HTTPS) — daily .osc.gz diffs
+External:  OSM replication server (HTTPS) — daily .osc.gz diffs
+           default: planet.openstreetmap.org (full planet)
+           alt:     download.geofabrik.de (regional extract, e.g. Germany)
 ```
 
 - **One Linux VM** (`Standard_E32-8s_v5`) runs both the one-time initial
@@ -173,9 +178,19 @@ page cache (Step 0, see below), then loops `pyosmium-get-changes` →
 `osm2pgsql --append` until caught up, persisting the replication
 sequence in `osm2pgsql_properties`. With `MALWARE_SCAN=1` each diff
 is routed via blob storage and waits for a clean Defender verdict.
-The replication source (`REPLICATION_SERVER`) defaults to Geofabrik
-Germany; switch to [planet.openstreetmap.org](https://planet.openstreetmap.org/replication/day/)
-for a full-planet load.
+
+The upstream source is controlled by two env vars, both defaulting to
+the full planet from planet.openstreetmap.org:
+
+| Env var             | Default (full planet)                                       | Alternative (Geofabrik region, e.g. Germany)              |
+| ------------------- | ----------------------------------------------------------- | --------------------------------------------------------- |
+| `SOURCE_PBF_URL`    | `https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf`| `https://download.geofabrik.de/europe/germany-latest.osm.pbf` |
+| `REPLICATION_SERVER`| `https://planet.openstreetmap.org/replication/day/`         | `https://download.geofabrik.de/europe/germany-updates/`   |
+
+Always change **both** together — the replication server must match
+the PBF's coverage area. When switching to a regional extract, also
+adjust `PBF_BLOB_PATH` / `PBF_LOCAL_PATH` so the filename reflects
+the source (e.g. `initial/germany-latest.osm.pbf`).
 
 ### Cold cache vs warm cache (why Step 0 matters)
 
@@ -302,6 +317,36 @@ PG D32ds_v5 + P40 throughout) — see
 | 5 days catch-up (warm)                          | **~5 h**           |
 | One day, cold cache                             | many hours         |
 
+### Planet, measured (2026-07)
+
+Actual numbers from a full-planet build against the same architecture,
+with PG scaled **down** to `D8ds_v5` (8 vCore / 32 GiB) on P40 storage
+for steady-state updates, and the VM at `E32-8s_v5`:
+
+| Operation                                       | Planet (measured, D8ds_v5 PG) |
+| ----------------------------------------------- | ----------------------------- |
+| Initial load (`init-osm.sh`) on **D16ds_v5** PG | **~13 h**                     |
+| Initial load extrapolated to D8ds_v5 PG         | ~14-16 h                      |
+| One day of replication (warm) on **D8ds_v5** PG | **~30 min**                   |
+| Warm-up (`vmtouch -t nodes.bin`, ~112 GiB)      | **~12 s** (from OS page cache)|
+
+Notes:
+- Init on `D16ds_v5` PG showed sustained PG CPU ≈ 15% and RAM ≈ 30%.
+  P40 storage (7,500 IOPS / 250 MB/s) is the actual bottleneck, so
+  D16 vs D8 mostly matters for the CREATE INDEX phase only. `D8ds_v5`
+  VM I/O caps (12,800 IOPS / 288 MB/s uncached) still exceed P40's
+  ceiling, so the COPY phase runs at the same speed on either SKU.
+- Recommended pattern: bump PG to `D16ds_v5` for init only via
+  `az postgres flexible-server update` (online, ~1-2 min restart),
+  then scale back to `D8ds_v5` for daily updates to halve steady-state
+  compute cost.
+- Each daily update on the planet dataset is roughly one order of
+  magnitude larger than the Germany-extract number above because the
+  daily diff itself is ~50-100 MB and the affected geometry set spans
+  the whole planet.
+- Steady-state PG cache-hit ratio at ~93% on 780 GB DB with 8 GiB
+  `shared_buffers` — indexes fit in RAM, heap pages spill to P40.
+
 **Takeaway:** for a daily-cron VM that deallocates between runs, the
 two levers that matter are:
 
@@ -375,8 +420,11 @@ Germany numbers and the corresponding planet estimates side-by-side.
 - Bicep modules: only param values change (`vmSize`, `dataDiskSizeGB`,
   `dataDiskThroughputMBps`, `pgSkuName`, `pgStorageSizeGB`).
 - Scripts: [init-osm.sh](init-osm.sh) and [update-osm.sh](update-osm.sh)
-  are size-agnostic. Only `PBF_BLOB_PATH` and `REPLICATION_SERVER`
-  change (`https://planet.openstreetmap.org/replication/day/`).
+  are size-agnostic. The defaults already target the full planet
+  (`SOURCE_PBF_URL` = `https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf`,
+  `REPLICATION_SERVER` = `https://planet.openstreetmap.org/replication/day/`);
+  no script changes needed. Only override these two env vars (as a
+  pair) if you want a Geofabrik regional extract instead.
 - Defender for Cloud, JIT, malware scan, logging — unchanged.
 
 ### What to watch during the first planet run

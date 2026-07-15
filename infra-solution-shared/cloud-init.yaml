@@ -1,0 +1,170 @@
+#cloud-config
+# ─────────────────────────────────────────────────────────────────────────────
+# osm-import-vm cloud-init
+# ─────────────────────────────────────────────────────────────────────────────
+# Installs every tool update-osm.sh / init-osm.sh need:
+#   - osm2pgsql            (apt: osm2pgsql)
+#   - pyosmium-get-changes (apt: pyosmium)
+#   - azcopy               (Microsoft repo: azcopy)
+#   - postgresql-client    (apt: postgresql-client)
+#   - azure-cli            (Microsoft script)
+#   - jq, curl             (apt)
+#
+# Also formats + mounts the data disk on /mnt/data (Premium SSD), where
+# nodes.bin, the source PBF, and the per-iteration diff live.
+# ─────────────────────────────────────────────────────────────────────────────
+package_update: true
+package_upgrade: false
+
+apt:
+  sources:
+    azure-cli:
+      source: "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli noble main"
+    microsoft-prod:
+      source: "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/24.04/prod noble main"
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - jq
+  - postgresql-client
+  - osm2pgsql
+  - pyosmium
+  - azcopy
+
+write_files:
+  - path: /etc/profile.d/osm-updater.sh
+    permissions: '0644'
+    content: |
+      # Convenience defaults so interactive ssh sessions work like the script.
+      export PGSSLMODE=require
+
+  # ─────────────────────────────────────────────────────────────────
+  # On-boot wrapper for update-osm.sh
+  #
+  # Runs from a systemd unit on every VM start. Safely no-ops when
+  # the initial import has not been done yet (i.e. before the first
+  # `./init-osm.sh` run) so a freshly provisioned VM does NOT crash
+  # its boot on the missing flat-nodes file. Guards:
+  #   1. update-osm.sh must exist (deployed by vm.bicep CustomScript
+  #      extension; may still be pending on the very first boot).
+  #   2. /mnt/data must be mounted (data disk formatted + fstab in
+  #      place — done later in this cloud-init).
+  #   3. /mnt/data/nodes.bin must be non-empty — the marker that
+  #      init-osm.sh has completed at least once.
+  # If any guard fails, log to the journal and exit 0 so the boot
+  # target stays green.
+  # ─────────────────────────────────────────────────────────────────
+  - path: /usr/local/sbin/osm-update-on-boot.sh
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -uo pipefail
+
+      log() { printf '[osm-update-on-boot] %s\n' "$*"; }
+
+      UPDATE_SCRIPT="/home/osmadmin/update-osm.sh"
+      FLAT_NODES_PATH="${FLAT_NODES_PATH:-/mnt/data/nodes.bin}"
+
+      # Load deploy-time env (UAI_CLIENT_ID, KEY_VAULT_NAME, PGHOST, ...)
+      # written by vm.bicep. `-r` guard keeps first-boot ordering safe.
+      if [ -r /etc/profile.d/osm-env.sh ]; then
+          # shellcheck disable=SC1091
+          . /etc/profile.d/osm-env.sh
+      fi
+
+      if [ ! -x "$UPDATE_SCRIPT" ]; then
+          log "update-osm.sh not found at $UPDATE_SCRIPT — VM not fully provisioned yet, skipping."
+          exit 0
+      fi
+
+      if ! mountpoint -q /mnt/data; then
+          log "/mnt/data is not mounted yet — skipping."
+          exit 0
+      fi
+
+      if [ ! -s "$FLAT_NODES_PATH" ]; then
+          log "$FLAT_NODES_PATH missing or empty — init-osm.sh has not been run yet. Skipping update."
+          exit 0
+      fi
+
+      log "Starting update-osm.sh as $(id -un)..."
+      # stdbuf -oL -eL forces line buffering on stdout/stderr. Without
+      # this, osm2pgsql's progress lines block-buffer in userland (~4KB)
+      # when stdout is a systemd journal pipe instead of a terminal, and
+      # journalctl -f goes silent for minutes at a time between flushes
+      # — indistinguishable from a real hang. tmux runs are unaffected
+      # because their pty is line-buffered by default.
+      exec stdbuf -oL -eL "$UPDATE_SCRIPT"
+
+  - path: /etc/systemd/system/osm-update-on-boot.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Run OSM replication update-osm.sh on every VM boot
+      # Wait for network + the data disk mount before firing. We deliberately
+      # do NOT list cloud-final.service in After=: on Ubuntu 24.04 that
+      # creates an ordering cycle with multi-user.target and systemd silently
+      # deletes our start job on every boot ("Found ordering cycle on
+      # osm-update-on-boot.service/start … Job deleted to break ordering
+      # cycle"). The wrapper script's own guards (update-osm.sh present,
+      # /mnt/data mounted, /mnt/data/nodes.bin non-empty) already make
+      # first-boot ordering vs. the CustomScript extension a no-op safely.
+      After=network-online.target mnt-data.mount
+      Wants=network-online.target
+      # Do not block boot if the data disk is not attached for some reason.
+      # The wrapper script re-checks and exits 0 in that case anyway.
+
+      [Service]
+      Type=oneshot
+      User=osmadmin
+      Group=osmadmin
+      # Environment overrides for update-osm.sh. Add more here rather
+      # than shelling out `systemctl set-environment` (which does not
+      # survive a reboot).
+      #   HB_INTERVAL   — seconds between Step 3 heartbeat lines in
+      #                   the journal. 300 = one line every 5 min.
+      Environment=HB_INTERVAL=300
+      ExecStart=/usr/local/sbin/osm-update-on-boot.sh
+      StandardOutput=journal
+      StandardError=journal
+      # update-osm.sh is a long-running catch-up loop; do not kill it
+      # on a slow run.
+      TimeoutStartSec=0
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  # Microsoft signing key for azure-cli + azcopy apt repos.
+  - mkdir -p /etc/apt/keyrings
+  - bash -c 'curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg'
+  - chmod a+r /etc/apt/keyrings/microsoft.gpg
+  - apt-get update
+  - apt-get install -y azure-cli azcopy
+
+  # storage-blob-preview extension is required for `az storage blob tag list`
+  # (used by update-osm.sh wait_for_scan to read Defender malware-scan tags).
+  - su - osmadmin -c 'az config set extension.use_dynamic_install=yes_without_prompt'
+  - su - osmadmin -c 'az extension add --name storage-blob-preview --yes --only-show-errors'
+
+  # Format and mount the data disk (LUN 0 → /dev/disk/azure/scsi1/lun0)
+  - bash -c 'set -e; DEV=$(readlink -f /dev/disk/azure/scsi1/lun0); if ! blkid "$DEV" >/dev/null 2>&1; then mkfs.ext4 -F -L osm-data "$DEV"; fi'
+  - mkdir -p /mnt/data
+  - bash -c 'grep -q "/mnt/data" /etc/fstab || echo "LABEL=osm-data /mnt/data ext4 defaults,nofail,discard 0 2" >> /etc/fstab'
+  - mount -a
+  - chown osmadmin:osmadmin /mnt/data
+
+  # Working dir for update-osm.sh systemd unit (created later by you).
+  - mkdir -p /var/lib/osm-updater
+  - chown osmadmin:osmadmin /var/lib/osm-updater
+
+  # Enable the on-boot update service. It will fire on every subsequent
+  # start of the VM and safely no-op until init-osm.sh has produced
+  # /mnt/data/nodes.bin. We do NOT `start` it here — cloud-init runs
+  # on the very first boot before init-osm.sh has ever been executed,
+  # so the guarded wrapper would just skip. From boot #2 onwards the
+  # multi-user.target activation triggers it automatically.
+  - systemctl daemon-reload
+  - systemctl enable osm-update-on-boot.service

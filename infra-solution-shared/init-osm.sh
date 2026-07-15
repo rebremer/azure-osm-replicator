@@ -23,19 +23,35 @@
 #   UAI_CLIENT_ID                             VM's managed identity client id
 #   STORAGE_ACCOUNT                           default: testpubliclandingzone
 #   CONTAINER_NAME                            default: osmscanning
-#   PBF_BLOB_PATH                             default: initial/germany-latest.osm.pbf
-#   PBF_LOCAL_PATH                            default: /mnt/data/germany-latest.osm.pbf
-#   GEOFABRIK_PBF_URL                         Source PBF URL. Streamed into
+#   PBF_BLOB_PATH                             default: initial/planet-latest.osm.pbf
+#   PBF_LOCAL_PATH                            default: /mnt/data/planet-latest.osm.pbf
+#   SOURCE_PBF_URL                            Source PBF URL. Streamed into
 #                                             blob storage if PBF_BLOB_PATH
-#                                             does not yet exist.
-#                                             default: https://download.geofabrik.de/europe/germany-latest.osm.pbf
+#                                             does not yet exist. Any HTTPS
+#                                             PBF works.
+#                                             default: https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf
+#                                                      (full planet, ~80 GB)
+#                                             alt:     https://download.geofabrik.de/europe/germany-latest.osm.pbf
+#                                                      (Geofabrik regional extract, e.g. Germany ~4 GB)
+#                                             When using a regional extract,
+#                                             also point REPLICATION_SERVER at
+#                                             the matching Geofabrik updates
+#                                             URL (see below) and update
+#                                             PBF_BLOB_PATH / PBF_LOCAL_PATH
+#                                             so the filename matches.
+#   REPLICATION_SERVER                        Daily diff source used by Step 5
+#                                             (osm2pgsql-replication init).
+#                                             default: https://planet.openstreetmap.org/replication/day/
+#                                                      (matches the planet PBF above)
+#                                             alt:     https://download.geofabrik.de/europe/germany-updates/
+#                                                      (matches the Geofabrik regional PBF)
 #   FLAT_NODES_PATH                           default: /mnt/data/nodes.bin
 #   OSM2PGSQL_CACHE_MB                        default: 0
 #                                             With --flat-nodes the -C node cache is unused;
 #                                             0 frees RAM for OS page cache (nodes.bin / PBF).
 #   OSM2PGSQL_PROCESSES                       default: 16
 #   SKIP_DOWNLOAD                             default: 0
-#                                             1 = skip the Geofabrik fetch in
+#                                             1 = skip the upstream fetch in
 #                                             Step 1b. The blob at PBF_BLOB_PATH
 #                                             must already exist; Step 2 still
 #                                             downloads it to PBF_LOCAL_PATH.
@@ -49,16 +65,27 @@
 #                                             blobs before re-importing)
 #   RESET_ALL_PBF                             default: 0  (with RESET_ALL=1,
 #                                             also delete the source PBF blob
-#                                             so it is re-fetched from Geofabrik)
+#                                             so it is re-fetched from the
+#                                             upstream SOURCE_PBF_URL)
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-UAI_CLIENT_ID="${UAI_CLIENT_ID:-d9215390-9665-46ea-932c-96946f75dc43}"
+# UAI_CLIENT_ID: Client ID of the user-assigned managed identity attached
+# to this VM. Not a secret — an attacker still needs Azure RBAC to use
+# it — but resource-specific, so injected via /etc/profile.d/osm-env.sh
+# by vm.bicep at deploy time. No default: fail fast if unset.
+: "${UAI_CLIENT_ID:?Set UAI_CLIENT_ID (managed identity client ID)}"
 STORAGE_ACCOUNT="${STORAGE_ACCOUNT:-testpubliclandingzone}"
 CONTAINER_NAME="${CONTAINER_NAME:-osmscanning}"
-PBF_BLOB_PATH="${PBF_BLOB_PATH:-initial/germany-latest.osm.pbf}"
-PBF_LOCAL_PATH="${PBF_LOCAL_PATH:-/mnt/data/germany-latest.osm.pbf}"
-GEOFABRIK_PBF_URL="${GEOFABRIK_PBF_URL:-https://download.geofabrik.de/europe/germany-latest.osm.pbf}"
+PBF_BLOB_PATH="${PBF_BLOB_PATH:-initial/planet-latest.osm.pbf}"
+PBF_LOCAL_PATH="${PBF_LOCAL_PATH:-/mnt/data/planet-latest.osm.pbf}"
+# SOURCE_PBF_URL: upstream PBF. Defaults to the full planet from
+# planet.openstreetmap.org. For a regional load, override to a
+# Geofabrik extract, e.g.
+#   export SOURCE_PBF_URL=https://download.geofabrik.de/europe/germany-latest.osm.pbf
+# and also override REPLICATION_SERVER (see Step 5 below) to the
+# matching Geofabrik updates URL.
+SOURCE_PBF_URL="${SOURCE_PBF_URL:-https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf}"
 FLAT_NODES_PATH="${FLAT_NODES_PATH:-/mnt/data/nodes.bin}"
 OSM2PGSQL_CACHE_MB="${OSM2PGSQL_CACHE_MB:-0}"
 OSM2PGSQL_PROCESSES="${OSM2PGSQL_PROCESSES:-16}"
@@ -86,7 +113,7 @@ imds_token() {
 
 # ── PostgreSQL connection (override via env if needed) ────────────────
 PGHOST="${PGHOST:-test-database-pg.postgres.database.azure.com}"
-PGUSER="${PGUSER:-bremerov}"
+PGUSER="${PGUSER:-osmuser}"
 PGDATABASE="${PGDATABASE:-osm}"
 export PGHOST PGUSER PGDATABASE
 
@@ -131,7 +158,7 @@ PBF_BLOB_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}
 echo "=== OSM initial load (VM edition) ==="
 echo "Started at:         $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 echo "Host:               $(hostname)"
-echo "Geofabrik source:   ${GEOFABRIK_PBF_URL}"
+echo "Source PBF URL:     ${SOURCE_PBF_URL}"
 echo "PBF blob URL:       ${PBF_BLOB_URL}"
 echo "PBF local path:     ${PBF_LOCAL_PATH}"
 echo "Flat-nodes file:    ${FLAT_NODES_PATH}"
@@ -185,7 +212,8 @@ fi
 # ──────────────────────────────────────────────
 # RESET_ALL: also wipe the on-disk flat-nodes file and the replication
 # blobs (seq-*/ and pending/) in the storage container. The source PBF
-# blob is kept by default so we don't re-download ~4 GB from Geofabrik;
+# blob is kept by default so we don't re-download the PBF from upstream
+# (~4 GB for Germany, ~80 GB for a full planet);
 # set RESET_ALL_PBF=1 to delete that too.
 # ──────────────────────────────────────────────
 if [ "${RESET_ALL}" = "1" ]; then
@@ -223,10 +251,10 @@ fi
 # Step 1b: Ensure the source PBF is present in blob storage.
 #
 # Always checks whether ${PBF_BLOB_PATH} exists in the container. If it
-# does, we reuse it. If it does not, we stream it from Geofabrik straight
-# into the container so it never touches local disk on the way in (which
-# lets Defender for Storage malware-scan the upload and tag it before
-# Step 2 reads it back).
+# does, we reuse it. If it does not, we stream it from upstream
+# (SOURCE_PBF_URL) straight into the container so it never touches
+# local disk on the way in (which lets Defender for Storage malware-scan
+# the upload and tag it before Step 2 reads it back).
 #
 # SKIP_DOWNLOAD=1 short-circuits the check — the caller asserts the
 # blob already exists (typically a dated PBF for a catch-up demo).
@@ -258,13 +286,13 @@ else
             ;;
     esac
     if [ "${BLOB_EXISTS}" = "true" ]; then
-        echo "Blob already present — skipping Geofabrik download."
+        echo "Blob already present — skipping upstream download."
     else
-        echo "Streaming ${GEOFABRIK_PBF_URL} → ${PBF_BLOB_URL}"
+        echo "Streaming ${SOURCE_PBF_URL} → ${PBF_BLOB_URL}"
         # curl → azcopy pipe: no local copy of the unscanned PBF.
         # --fail makes curl exit non-zero on HTTP errors; -L follows redirects.
         set -o pipefail
-        curl -fSL "${GEOFABRIK_PBF_URL}" \
+        curl -fSL "${SOURCE_PBF_URL}" \
           | azcopy copy "${PBF_BLOB_URL}" --from-to=PipeBlob --overwrite=true
         set +o pipefail
         echo "Upload complete."
@@ -331,8 +359,13 @@ echo "osm2pgsql completed in $(( $(date +%s) - T0 ))s"
 # update-osm.sh refuses to run without these rows. Initialise them from
 # the configured replication server so the first --append knows where to
 # resume.
+#
+# Default matches SOURCE_PBF_URL (full planet, daily). For a Geofabrik
+# regional extract, override REPLICATION_SERVER to the matching
+# `-updates/` path, e.g.
+#   export REPLICATION_SERVER=https://download.geofabrik.de/europe/germany-updates/
 # ──────────────────────────────────────────────
-REPLICATION_SERVER="${REPLICATION_SERVER:-https://download.geofabrik.de/europe/germany-updates/}"
+REPLICATION_SERVER="${REPLICATION_SERVER:-https://planet.openstreetmap.org/replication/day/}"
 echo ""
 echo "=== Step 5: osm2pgsql-replication init (server ${REPLICATION_SERVER}) ==="
 osm2pgsql-replication init \

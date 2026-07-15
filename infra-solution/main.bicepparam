@@ -44,8 +44,8 @@ param postgresServerResourceId  = '/subscriptions/${subId}/resourceGroups/${pgRg
 param keyVaultName         = readEnvironmentVariable('KV_NAME_PREFIX', 'osm-updater-kv2')
 param pgPasswordSecretName = 'pg-admin-password'
 // Threaded into /etc/profile.d/osm-env.sh on the VM as PGUSER / PGDATABASE.
-// PGUSER must match the login used in postgres.bicep (default 'bremerov').
-param pgAdminLogin   = readEnvironmentVariable('PG_ADMIN_LOGIN', 'bremerov')
+// PGUSER must match the login used in postgres.bicep (default 'osmuser').
+param pgAdminLogin   = readEnvironmentVariable('PG_ADMIN_LOGIN', 'osmuser')
 param pgDatabaseName = readEnvironmentVariable('PG_DATABASE', 'osm')
 // Threaded into osm-env.sh as CONTAINER_NAME.
 param containerName  = readEnvironmentVariable('CONTAINER_NAME', 'osmscanning')

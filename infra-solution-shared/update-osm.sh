@@ -16,7 +16,11 @@
 #                                             admin password secret. Used
 #                                             when PGPASSWORD is not set.
 #   PG_PASSWORD_SECRET_NAME                   default: pg-admin-password
-#   REPLICATION_SERVER                        default: Geofabrik Germany
+#   REPLICATION_SERVER                        default: planet.openstreetmap.org daily
+#                                             (https://planet.openstreetmap.org/replication/day/)
+#                                             For a regional load, point at a
+#                                             matching Geofabrik updates URL, e.g.
+#                                             https://download.geofabrik.de/europe/germany-updates/
 #   FLAT_NODES_PATH                           default: /mnt/data/nodes.bin
 #                                              (PremiumV2 SSD, 10000 IOPS /
 #                                              256 MB/s — sized for random
@@ -28,6 +32,18 @@
 #   WORK_DIR                                  default: $HOME/osm-work
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
+
+# ── Guard against terminal stop signals ──────────────────────────────
+# During interactive perf-testing we've hit multiple runs where azcopy
+# (and everything downstream) ended up in kernel state T
+# ("do_signal_stop") after a stray Ctrl-Z inside a tmux pane, or after
+# spurious SIGTTIN/SIGTTOU under certain tmux versions. Ignoring these
+# signals for the duration of the run (and — via SIG_IGN inheritance —
+# for every child process it execs, including azcopy) turns those
+# fat-finger events into no-ops. Trap ONLY the terminal stop signals;
+# SIGINT / SIGTERM are still honoured so Ctrl-C and `systemctl stop`
+# work as expected.
+trap '' TSTP TTIN TTOU
 
 # ── Timestamped logger ───────────────────────────────────────────────
 # Every diagnostic line is prefixed with a UTC timestamp + monotonic
@@ -51,7 +67,7 @@ log() {
 DEBUG="${DEBUG:-0}"
 dlog() { [ "${DEBUG}" = "1" ] && log "$@"; return 0; }
 
-REPLICATION_SERVER="${REPLICATION_SERVER:-https://download.geofabrik.de/europe/germany-updates/}"
+REPLICATION_SERVER="${REPLICATION_SERVER:-https://planet.openstreetmap.org/replication/day/}"
 # Keep nodes.bin on the PremiumV2 SSD at /mnt/data. The disk is sized
 # (10000 IOPS, 256 MB/s) so --append's random 8-byte lookups are served
 # from disk on every run, even after a VM stop/start wipes the page cache.
@@ -65,7 +81,11 @@ WORK_DIR="${WORK_DIR:-${HOME}/osm-work}"
 MALWARE_SCAN="${MALWARE_SCAN:-1}"
 STORAGE_ACCOUNT="${STORAGE_ACCOUNT:-testpubliclandingzone}"
 CONTAINER_NAME="${CONTAINER_NAME:-osmscanning}"
-UAI_CLIENT_ID="${UAI_CLIENT_ID:-d9215390-9665-46ea-932c-96946f75dc43}"
+# UAI_CLIENT_ID: Client ID of the user-assigned managed identity attached
+# to this VM. Not a secret — an attacker still needs Azure RBAC to use
+# it — but resource-specific, so injected via /etc/profile.d/osm-env.sh
+# by vm.bicep at deploy time. No default: fail fast if unset.
+: "${UAI_CLIENT_ID:?Set UAI_CLIENT_ID (managed identity client ID)}"
 MAX_SCAN_WAIT="${MAX_SCAN_WAIT:-300}"
 SCAN_POLL_INTERVAL="${SCAN_POLL_INTERVAL:-15}"
 
@@ -80,7 +100,7 @@ SCAN_POLL_INTERVAL="${SCAN_POLL_INTERVAL:-15}"
 
 # ── PostgreSQL connection (override via env if needed) ────────────────
 PGHOST="${PGHOST:-test-database-pg.postgres.database.azure.com}"
-PGUSER="${PGUSER:-bremerov}"
+PGUSER="${PGUSER:-osmuser}"
 PGDATABASE="${PGDATABASE:-osm}"
 export PGHOST PGUSER PGDATABASE
 
@@ -204,6 +224,17 @@ if [ "${MALWARE_SCAN}" = "1" ]; then
     export AZCOPY_LOG_LOCATION="${WORK_DIR}/azcopy-logs"
     export AZCOPY_JOB_PLAN_LOCATION="${WORK_DIR}/azcopy-plans"
     mkdir -p "${AZCOPY_LOG_LOCATION}" "${AZCOPY_JOB_PLAN_LOCATION}"
+    # ALZ egress lockdown: azcopy's default startup checks reach out to
+    # public endpoints that have no private-endpoint counterpart, and
+    # hang on TCP connect the same way `az login --identity` hits ARM.
+    #   - Update check: GET https://azcopyvnext.azureedge.net/latest/...
+    #   - Anonymous crash/telemetry beacon
+    # Both are disabled below. Concurrency is pinned so azcopy skips its
+    # initial bandwidth benchmark (opens many parallel connections up
+    # front — under a tight egress path this can also stall silently).
+    export AZCOPY_UPDATE_CHECK=false
+    export AZCOPY_DISABLE_HIERARCHICAL_SCAN=true
+    export AZCOPY_CONCURRENCY_VALUE="${AZCOPY_CONCURRENCY_VALUE:-8}"
 fi
 
 # Helper: fetch an AAD bearer token for an Azure resource via IMDS using
@@ -554,9 +585,17 @@ while true; do
         wait_for_scan "${STATE_BLOB_NAME}"
 
         # Now safe to materialise the scanned blobs locally for osm2pgsql.
+        # Explicit --from-to=BlobLocal skips source auto-detection. Visible
+        # logging surfaces auth / DNS / TCP hangs to the terminal (the
+        # AZCOPY_UPDATE_CHECK=false env var above is what actually prevents
+        # the classic multi-minute stall to the public azcopyvnext CDN).
         echo "Downloading scanned diff + state to local work dir..."
-        azcopy copy "${DIFF_BLOB_URL}"  "${LOCAL_DIFF}"  --overwrite=true
-        azcopy copy "${STATE_BLOB_URL}" "${LOCAL_STATE}" --overwrite=true
+        azcopy copy "${DIFF_BLOB_URL}"  "${LOCAL_DIFF}" \
+            --from-to=BlobLocal --overwrite=true \
+            --check-md5=NoCheck --log-level=INFO --output-level=essential
+        azcopy copy "${STATE_BLOB_URL}" "${LOCAL_STATE}" \
+            --from-to=BlobLocal --overwrite=true \
+            --check-md5=NoCheck --log-level=INFO --output-level=essential
         echo "Diff size: $(stat -c%s "${LOCAL_DIFF}") bytes"
     else
         # No-scan path: write directly to local disk.
@@ -595,14 +634,70 @@ while true; do
     echo ""
     echo "=== Step 3: Applying changes to database ==="
 
+    # osm2pgsql --append is largely silent for the entire 10-30 min
+    # per iteration (unlike --create which streams per-object progress).
+    # Under systemd, the journal therefore looks frozen between the
+    # "Setting up table" lines and the final "osm2pgsql took N s"
+    # summary. To give observability we run osm2pgsql in the background
+    # and, while it's alive, poll pg_stat_activity every 60s to print a
+    # single compact heartbeat line into the journal. Under tmux this
+    # is redundant with what the user already sees, but harmless.
+    STEP3_LOG="${WORK_DIR}/osm2pgsql-step3.log"
+    rm -f "${STEP3_LOG}"
+
     osm2pgsql --append --slim \
         --number-processes "${OSM2PGSQL_PROCESSES}" \
         --cache "${OSM2PGSQL_CACHE_MB}" \
         --flat-nodes "${FLAT_NODES_PATH}" \
+        --log-progress=true \
         -d "${PGDATABASE}" \
         -H "${PGHOST}" \
         -U "${PGUSER}" \
-        "${LOCAL_DIFF}"
+        "${LOCAL_DIFF}" > "${STEP3_LOG}" 2>&1 &
+    OSM_PID=$!
+    STEP3_T0=$(date +%s)
+
+    # Heartbeat loop: single-line summary of the top active PG sessions
+    # belonging to ${PGUSER} (ordered by query_start). Cheap query,
+    # 300s cadence → ~1 line every 5 min, ~6 lines per iteration.
+    # NB: uses POSIX '[[:space:]]+' rather than PG E-strings (E'\\s+')
+    # because bash + psql double-quote escaping made the latter collapse
+    # to plain 's+', which regexp_replace then turned every 's' in the
+    # query text into a space (making osm2pgsql → "o m2pg ql", etc).
+    HB_INTERVAL="${HB_INTERVAL:-300}"
+    while kill -0 "${OSM_PID}" 2>/dev/null; do
+        sleep "${HB_INTERVAL}"
+        kill -0 "${OSM_PID}" 2>/dev/null || break
+        HB=$(psql -h "${PGHOST}" -U "${PGUSER}" -d "${PGDATABASE}" \
+            -X -A -t -F '|' -c "
+            SELECT string_agg(
+                pid || '/' || state || '/' || COALESCE(wait_event,'run')
+                || '/' || to_char(now()-query_start,'MI:SS')
+                || ' ' || left(regexp_replace(query,'[[:space:]]+',' ','g'),80),
+                ' || '
+                ORDER BY query_start)
+            FROM pg_stat_activity
+            WHERE usename='${PGUSER}' AND pid <> pg_backend_pid()
+              AND state <> 'idle';" 2>/dev/null || echo "(psql heartbeat probe failed)")
+        log "  Step 3 heartbeat: t=$(( $(date +%s) - STEP3_T0 ))s  pg=[${HB:-no-active-sessions}]"
+    done
+
+    wait "${OSM_PID}"
+    OSM_RC=$?
+
+    # Emit osm2pgsql's own stdout/stderr into the journal, in one
+    # burst at the end. Useful for the final "Reading time / Overall
+    # memory / osm2pgsql took N s" summary regardless of shell.
+    if [ -s "${STEP3_LOG}" ]; then
+        echo "--- osm2pgsql output ---"
+        cat "${STEP3_LOG}"
+        echo "--- end osm2pgsql output ---"
+    fi
+
+    if [ "${OSM_RC}" != "0" ]; then
+        echo "ERROR: osm2pgsql --append failed with exit code ${OSM_RC}." >&2
+        exit "${OSM_RC}"
+    fi
 
     # ──────────────────────────────────────────────
     # Step 4: Advance osm2pgsql_properties (osm2pgsql --append does NOT do this)

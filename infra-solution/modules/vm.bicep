@@ -68,13 +68,13 @@ param osDiskOmitImmutableProps bool = true
 param enablePublicIp bool = true
 
 @description('Optional cloud-init YAML to bootstrap the VM (osm2pgsql, azcopy, pyosmium, mounts).')
-param cloudInit string = loadTextContent('cloud-init.yaml')
+param cloudInit string = loadTextContent('../../infra-solution-shared/cloud-init.yaml')
 
 @description('init-osm.sh contents, materialised into /home/<adminUsername>/init-osm.sh by the CustomScript extension.')
-param initOsmScript string = loadTextContent('../../init-osm.sh')
+param initOsmScript string = loadTextContent('../../infra-solution-shared/init-osm.sh')
 
 @description('update-osm.sh contents, materialised into /home/<adminUsername>/update-osm.sh by the CustomScript extension.')
-param updateOsmScript string = loadTextContent('../../update-osm.sh')
+param updateOsmScript string = loadTextContent('../../infra-solution-shared/update-osm.sh')
 
 // ── Runtime env baked into /etc/profile.d/osm-env.sh at deploy time. ──
 // These flow from main.bicep so interactive shells (and
@@ -90,7 +90,7 @@ param pgPasswordSecretName string = 'pg-admin-password'
 param pgServerFqdn string = ''
 
 @description('PostgreSQL admin login. Written to osm-env.sh as PGUSER.')
-param pgAdminLogin string = 'bremerov'
+param pgAdminLogin string = 'osmuser'
 
 @description('PostgreSQL database name. Written to osm-env.sh as PGDATABASE.')
 param pgDatabaseName string = 'osm'

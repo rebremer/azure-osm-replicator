@@ -4,4 +4,8 @@
 *.sh              text eol=lf
 *.bicep           text eol=lf
 *.bicepparam      text eol=lf
+*.tf              text eol=lf
+*.tfvars          text eol=lf
+*.yaml            text eol=lf
+*.yml             text eol=lf
 cloud-init.yaml   text eol=lf
