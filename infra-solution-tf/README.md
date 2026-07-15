@@ -57,18 +57,48 @@ state.
 The one-shot equivalent of `infra-solution/deploy.sh`:
 
 ```bash
-export CORE_RG=test-osm-solution-rg
+# ── 1. Sign in ───────────────────────────────────────────────────────
+az login --tenant <TENANT_ID>
+az account set --subscription <SUBSCRIPTION_ID>
+az account show --query '{name:name, id:id, tenantId:tenantId, user:user.name}' -o table
+
+# ── 2. Resource groups ───────────────────────────────────────────────
+export CORE_RG=test-osm-solution-tf-rg
+export STORAGE_RG="$CORE_RG"        # single-RG greenfield; split for shared SA
+export PG_RG="$CORE_RG"             # single-RG greenfield; split for shared PG
 export NETWORK_RG=test-osm-netwerk-rg
 export LOCATION=westus3
 
-# Secrets (never commit these)
-export VM_ADMIN_PASSWORD='...'     # OR: USE_SSH_KEY=true SSH_PUBLIC_KEY='ssh-rsa ...'
-export PG_ADMIN_PASSWORD='...'
+# ── 3. Globally-unique resource names ────────────────────────────────
+export STORAGE_ACCOUNT_NAME='<3-24 lowercase globally unique>'   # e.g. testosmstorv2tf
+export PG_SERVER_NAME='<globally unique>'                         # e.g. testosmpgv2tf
+export KV_NAME_PREFIX='osm-updater-kv3'                           # bump if a prior KV is soft-deleted
 
-# Optional: also create the storage account / PG server from scratch
-# export DEPLOY_STORAGE=1
-# export DEPLOY_PG=1
+# ── 4. What to create ────────────────────────────────────────────────
+export DEPLOY_STORAGE=1             # 0 = re-use an existing SA
+export DEPLOY_PG=1                  # 0 = re-use an existing PG server
 
+# ── 5. Secrets — DO NOT COMMIT ───────────────────────────────────────
+export PG_ADMIN_PASSWORD='<pg admin password>'
+export USE_SSH_KEY=true
+export SSH_PUBLIC_KEY="$(cat ./osm-vm-key.pub)"   # from ssh-keygen
+export SSH_KEY=./osm-vm-key                       # local private key for later SSH
+# — or, if you prefer password auth on the VM:
+# export USE_SSH_KEY=false
+# export VM_ADMIN_PASSWORD='<vm admin password>'
+
+# ── 6. Pre-existing network IDs (skip auto-discovery) ────────────────
+# Look up once with:
+#   az network vnet list -g "$NETWORK_RG" --query "[].{name:name, id:id}" -o table
+#   az network vnet subnet list -g "$NETWORK_RG" --vnet-name <VNET_NAME> \
+#     --query "[].{name:name, id:id}" -o table
+export SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+export VNET_RESOURCE_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$NETWORK_RG/providers/Microsoft.Network/virtualNetworks/<VNET_NAME>"
+export PE_SUBNET_ID="$VNET_RESOURCE_ID/subnets/<PE_SUBNET_NAME>"
+export VM_SUBNET_ID="$VNET_RESOURCE_ID/subnets/<VM_SUBNET_NAME>"
+
+# ── 7. Deploy ────────────────────────────────────────────────────────
+az group create -n "$CORE_RG" -l "$LOCATION" -o none
 bash infra-solution-tf/deploy.sh
 ```
 
