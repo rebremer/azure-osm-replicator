@@ -70,6 +70,13 @@ param keyVaultEnablePurgeProtection = bool(readEnvironmentVariable('KV_ENABLE_PU
 // provides the same reachability.
 param enablePublicIp = bool(readEnvironmentVariable('ENABLE_PUBLIC_IP', 'true'))
 
+// ── Daily auto-shutdown ───────────────────────────────────────────────
+// Uses Microsoft.DevTestLab/schedules — same as the Portal's
+// "Auto-shutdown" blade. Default 03:00 W. Europe Standard Time.
+param autoShutdownEnabled  = bool(readEnvironmentVariable('AUTOSHUTDOWN_ENABLED', 'true'))
+param autoShutdownTime     = readEnvironmentVariable('AUTOSHUTDOWN_TIME', '0300')
+param autoShutdownTimezone = readEnvironmentVariable('AUTOSHUTDOWN_TIMEZONE', 'W. Europe Standard Time')
+
 // ── Pre-existing network resources (script 1 outputs) ─────────────────
 // deploy-network.sh deploys network.bicep to NETWORK_RG and prints
 // these IDs. deploy.sh either reads them from the latest network

@@ -95,6 +95,15 @@ param keyVaultEnablePurgeProtection bool = true
 @description('Attach a Standard Static Public IP to the VM NIC. Default true — needed for SSH-in and deterministic IPv4 egress since this stack has no NAT Gateway and no Bastion. Set false once a VPN/ExpressRoute is wired into the VNet.')
 param enablePublicIp bool = true
 
+@description('Create a daily auto-shutdown schedule for the VM.')
+param autoShutdownEnabled bool = true
+
+@description('Daily shutdown time (HHmm, 24h). 0300 = 03:00 local.')
+param autoShutdownTime string = '0300'
+
+@description('Windows time zone ID (e.g. "W. Europe Standard Time" for Amsterdam/CET).')
+param autoShutdownTimezone string = 'W. Europe Standard Time'
+
 // ──────────────────────────────────────────────
 // Pre-existing network resources (deployed by infra-vnet/network.bicep
 // into NETWORK_RG). Script 1 exports the VNet + subnet IDs; script 2
@@ -211,6 +220,9 @@ module vm 'modules/vm.bicep' = {
     subnetId: vmSubnetId
     availabilityZone: availabilityZone
     enablePublicIp: enablePublicIp
+    autoShutdownEnabled: autoShutdownEnabled
+    autoShutdownTime: autoShutdownTime
+    autoShutdownTimezone: autoShutdownTimezone
     // Values baked into /etc/profile.d/osm-env.sh on the VM.
     keyVaultName: keyVaultFullName
     pgPasswordSecretName: pgPasswordSecretName

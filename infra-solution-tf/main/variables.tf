@@ -114,6 +114,23 @@ variable "enable_public_ip" {
   default = true
 }
 
+variable "autoshutdown_enabled" {
+  type    = bool
+  default = true
+}
+
+variable "autoshutdown_time" {
+  description = "Daily shutdown time (HHmm, 24h). 0300 = 03:00 local."
+  type        = string
+  default     = "0300"
+}
+
+variable "autoshutdown_timezone" {
+  description = "Windows time zone ID."
+  type        = string
+  default     = "W. Europe Standard Time"
+}
+
 # ── Pre-existing network resources (deployed by infra-vnet). ──
 variable "vnet_resource_id" {
   type = string

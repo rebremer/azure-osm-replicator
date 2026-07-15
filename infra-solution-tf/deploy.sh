@@ -191,6 +191,10 @@ PG_RID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${PG_RG}/providers/Micr
     # with the same deterministic name is still soft-deleted and blocks
     # re-use of the name.
     export TF_VAR_key_vault_name_prefix="${KV_NAME_PREFIX:-osm-updater-kv2}"
+    # Daily VM auto-shutdown (defaults: enabled, 03:00 W. Europe Standard Time).
+    export TF_VAR_autoshutdown_enabled="${AUTOSHUTDOWN_ENABLED:-true}"
+    export TF_VAR_autoshutdown_time="${AUTOSHUTDOWN_TIME:-0300}"
+    export TF_VAR_autoshutdown_timezone="${AUTOSHUTDOWN_TIMEZONE:-W. Europe Standard Time}"
 
     terraform init -input=false
     terraform apply -auto-approve -input=false

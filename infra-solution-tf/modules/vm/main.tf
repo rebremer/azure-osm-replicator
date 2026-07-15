@@ -94,6 +94,25 @@ variable "enable_public_ip" {
   default = true
 }
 
+# ── Auto-shutdown schedule ────────────────────────────────────────────
+variable "autoshutdown_enabled" {
+  description = "Create a daily auto-shutdown schedule for the VM."
+  type        = bool
+  default     = true
+}
+
+variable "autoshutdown_time" {
+  description = "Daily shutdown time (24h, HHmm — no colon). 0300 = 03:00 local."
+  type        = string
+  default     = "0300"
+}
+
+variable "autoshutdown_timezone" {
+  description = "Windows time zone ID (e.g. 'W. Europe Standard Time' for Amsterdam/CET, 'Central European Standard Time' for Warsaw/Prague, 'UTC')."
+  type        = string
+  default     = "W. Europe Standard Time"
+}
+
 # ── Runtime env baked into /etc/profile.d/osm-env.sh at deploy time. ──
 variable "key_vault_name" {
   type    = string
@@ -336,6 +355,25 @@ resource "azurerm_virtual_machine_extension" "install_osm_scripts" {
   depends_on = [
     azurerm_virtual_machine_data_disk_attachment.data,
   ]
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Daily auto-shutdown. Uses the native azurerm resource (creates the
+# same Microsoft.DevTestLab/schedules the Portal's "Auto-shutdown"
+# blade creates). No email notification — set notification_settings
+# with an email if you want one.
+# ─────────────────────────────────────────────────────────────────────────────
+resource "azurerm_dev_test_global_vm_shutdown_schedule" "autoshutdown" {
+  count                 = var.autoshutdown_enabled ? 1 : 0
+  virtual_machine_id    = azurerm_linux_virtual_machine.vm.id
+  location              = var.location
+  enabled               = true
+  daily_recurrence_time = var.autoshutdown_time
+  timezone              = var.autoshutdown_timezone
+
+  notification_settings {
+    enabled = false
+  }
 }
 
 output "vm_id" {

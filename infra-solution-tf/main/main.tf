@@ -110,6 +110,9 @@ module "vm" {
   subnet_id              = var.vm_subnet_id
   availability_zone      = var.availability_zone
   enable_public_ip       = var.enable_public_ip
+  autoshutdown_enabled   = var.autoshutdown_enabled
+  autoshutdown_time      = var.autoshutdown_time
+  autoshutdown_timezone  = var.autoshutdown_timezone
   # Baked into /etc/profile.d/osm-env.sh on the VM.
   key_vault_name          = local.key_vault_full_name
   pg_password_secret_name = var.pg_password_secret_name

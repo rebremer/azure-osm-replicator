@@ -67,6 +67,15 @@ param osDiskOmitImmutableProps bool = true
 @description('Attach a Standard Static Public IP to the VM NIC. Default true — needed for SSH-in and deterministic IPv4 egress since this stack has no NAT Gateway and no Bastion. Set false once a VPN/ExpressRoute is wired into the VNet.')
 param enablePublicIp bool = true
 
+@description('Create a daily auto-shutdown schedule for the VM (Microsoft.DevTestLab/schedules).')
+param autoShutdownEnabled bool = true
+
+@description('Daily shutdown time (HHmm, 24h). 0300 = 03:00 local.')
+param autoShutdownTime string = '0300'
+
+@description('Windows time zone ID (e.g. "W. Europe Standard Time" for Amsterdam/CET, "Central European Standard Time" for Warsaw/Prague, "UTC").')
+param autoShutdownTimezone string = 'W. Europe Standard Time'
+
 @description('Optional cloud-init YAML to bootstrap the VM (osm2pgsql, azcopy, pyosmium, mounts).')
 param cloudInit string = loadTextContent('../../infra-solution-shared/cloud-init.yaml')
 
@@ -274,6 +283,30 @@ resource installOsmScripts 'Microsoft.Compute/virtualMachines/extensions@2024-11
     forceUpdateTag: uniqueString(initOsmScript, updateOsmScript, osmEnvFile)
     protectedSettings: {
       script: base64(installerScript)
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Daily auto-shutdown. This is the same resource the Portal's
+// "Auto-shutdown" blade creates (Microsoft.DevTestLab/schedules with the
+// magic name "shutdown-computevm-<vmName>"). No email notification —
+// add notificationSettings.emailRecipient if you want one.
+// ─────────────────────────────────────────────────────────────────────────────
+resource shutdownSchedule 'Microsoft.DevTestLab/schedules@2018-09-15' = if (autoShutdownEnabled) {
+  name: 'shutdown-computevm-${vmName}'
+  location: location
+  properties: {
+    status: 'Enabled'
+    taskType: 'ComputeVmShutdownTask'
+    dailyRecurrence: {
+      time: autoShutdownTime
+    }
+    timeZoneId: autoShutdownTimezone
+    targetResourceId: vm.id
+    notificationSettings: {
+      status: 'Disabled'
+      timeInMinutes: 30
     }
   }
 }
