@@ -70,6 +70,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
+# ── Guard against terminal stop signals ──────────────────────────────
+# Mirrors update-osm.sh: when this script runs inside tmux, azcopy
+# (and everything downstream) can end up in kernel state T
+# ("do_signal_stop") after a stray Ctrl-Z or spurious SIGTTIN/SIGTTOU
+# under certain tmux versions — indistinguishable from a network hang.
+# Ignoring these signals here means SIG_IGN inherits into every child
+# exec'd from this script (azcopy, osm2pgsql, psql). SIGINT / SIGTERM
+# are left alone so Ctrl-C and `systemctl stop` still work.
+trap '' TSTP TTIN TTOU
+
 # UAI_CLIENT_ID: Client ID of the user-assigned managed identity attached
 # to this VM. Not a secret — an attacker still needs Azure RBAC to use
 # it — but resource-specific, so injected via /etc/profile.d/osm-env.sh
@@ -99,6 +109,13 @@ RESET_ALL_PBF="${RESET_ALL_PBF:-0}"
 # ARM (management.azure.com) is unreachable.
 export AZCOPY_AUTO_LOGIN_TYPE="${AZCOPY_AUTO_LOGIN_TYPE:-MSI}"
 export AZCOPY_MSI_CLIENT_ID="${AZCOPY_MSI_CLIENT_ID:-${UAI_CLIENT_ID}}"
+# Disable azcopy's startup update check (GET against azcopyvnext.azureedge.net,
+# a public CDN with no private-endpoint counterpart under ALZ egress
+# lockdown — the request hangs for many minutes). Also pin the concurrency
+# so the auto-benchmark doesn't open hundreds of parallel connections
+# that never complete. Mirrors update-osm.sh; see repo memory notes.
+export AZCOPY_UPDATE_CHECK=false
+export AZCOPY_CONCURRENCY_VALUE="${AZCOPY_CONCURRENCY_VALUE:-8}"
 
 # Helper: fetch an AAD bearer token for an Azure resource via IMDS using
 # the VM's user-assigned managed identity. Avoids `az login --identity`,
