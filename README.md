@@ -20,8 +20,8 @@ Server.
    create the target database, allow-list `postgis` + `hstore`, reset
    the `public` schema and enable the extensions, and set
    `max_wal_size=16384` + `max_parallel_maintenance_workers=4`.
-3. Run [init-osm.sh](init-osm.sh) on the VM (~20 min for Germany on
-   the **D16ds_v5 / P30** baseline — no scale-up/scale-down dance
+3. Run [init-osm.sh](init-osm.sh) on the VM (~30 min for Germany on
+   the **D8ds_v5 / P30** baseline — no scale-up/scale-down dance
    needed; the same SKU handles both init and daily updates).
 4. Run [update-osm.sh](update-osm.sh) daily (wire to a systemd timer);
    Step 0 pre-warms `nodes.bin` into the OS page cache so each
@@ -31,8 +31,7 @@ Server.
 
 For the rationale behind each step (page-cache mechanics,
 `synchronous_commit=off`, why CAJ was rejected) see
-[Cold cache vs warm cache](#cold-cache-vs-warm-cache-why-step-0-matters),
-[Performance reference](#performance-reference), and
+[Performance reference](#performance-reference) and
 [Why VM](#why-vm-not-container-apps-job-not-always-on).
 For a full-planet build see [Scaling to planet](#scaling-to-planet).
 
@@ -48,7 +47,7 @@ Two resource groups, one Azure region:
 │  NSGs (attached to subnets   │    UAMI  (KV read, Storage Blob Data Owner)   │
 │  but resource-defined in     │                                               │
 │  CORE_RG via cross-RG        │  Storage account  (blob, Defender-scanned)    │
-│  bicep module — day-2 you    │  PG Flex Server   (v17, D16ds_v5, P30)        │
+│  bicep module — day-2 you    │  PG Flex Server   (v17, D8ds_v5, P30)         │
 │  edit rules from CORE_RG)    │  Key Vault        (RBAC, PE-only, holds       │
 │                              │                    pg-admin-password)          │
 │                              │  Private endpoints:  blob, PG, KV             │
@@ -63,7 +62,7 @@ External:  OSM replication server (HTTPS) — daily .osc.gz diffs
 - **One Linux VM** (`Standard_E32-8s_v5`) runs both the one-time initial
   import and the daily updater. Deallocated between runs; started a few
   minutes before each scheduled update.
-- **PostgreSQL Flexible Server** (`Standard_D16ds_v5`, P30 storage,
+- **PostgreSQL Flexible Server** (`Standard_D8ds_v5`, P30 storage,
   publicNetworkAccess=Disabled) stores `planet_osm_*` tables.
 - **One Premium SSD managed disk on the VM** (`/mnt/data`) holds
   `nodes.bin` and per-iteration diffs. Survives deallocate/start.
@@ -154,12 +153,12 @@ az keyvault purge -n <the-kv-name-from-deploy> --location westus3
    | `max_wal_size`                     | `16384` MB | Removes checkpoint stalls during the Node COPY phase.               |
    | `max_parallel_maintenance_workers` | `4`        | Parallel `CREATE INDEX` in the postprocess phase (biggest single win). |
 
-   Combined with the **D16ds_v5** baseline (16 vCores / 64 GiB RAM)
+   Combined with the **D8ds_v5** baseline (8 vCores / 32 GiB RAM)
    and **P30** Premium SSD v1 storage (1 TiB / 5,000 IOPS / 200 MB/s),
-   Germany init lands at **~20 min**. No scale-up/scale-down dance is
+   Germany init lands at **~30 min**. No scale-up/scale-down dance is
    required: the same SKU handles both init and daily updates.
-   `maintenance_work_mem` is already capped at 2 GB on D16ds_v5 and
-   doesn't need to be touched.
+   `maintenance_work_mem` on Azure PG Flex is capped at 2 GB regardless
+   of tier and doesn't need to be touched.
 
 ### Run
 
@@ -192,39 +191,6 @@ the PBF's coverage area. When switching to a regional extract, also
 adjust `PBF_BLOB_PATH` / `PBF_LOCAL_PATH` so the filename reflects
 the source (e.g. `initial/germany-latest.osm.pbf`).
 
-### Cold cache vs warm cache (why Step 0 matters)
-
-`osm2pgsql --append`'s Node phase issues **single-threaded random
-8-byte reads** against `nodes.bin`. Each read pays one round-trip to
-the disk:
-
-| State of `nodes.bin` | Per-op latency | Effective rate    |
-| -------------------- | -------------- | ----------------- |
-| In OS page cache     | ~50 ns (RAM)   | 60-100k+ nodes/s  |
-| On Premium SSD v2    | ~1 ms          | ~3k nodes/s       |
-
-That 20-30× gap is the difference between a 2-minute daily update and
-a 30-minute one. Provisioning more disk IOPS does **not** help — the
-phase is single-threaded and latency-bound, not IOPS-bound.
-
-A VM stop/deallocate (and any reboot) wipes RAM, so the page cache is
-cold on every boot. [update-osm.sh](update-osm.sh) Step 0 sequentially
-reads `nodes.bin` once via `vmtouch -t` to populate the cache. At
-~750 MB/s (the disk's provisioned throughput, capped by the VM's
-~865 MB/s uncached limit on `Standard_E32-8s_v5`) this costs ~70 s for
-a 50 GB Germany flat-nodes file; bumping the disk's provisioned MB/s
-shortens it proportionally up to the VM cap. After warm-up every
-subsequent random lookup is a RAM hit.
-
-A second piece of the same story: `osm2pgsql --append` runs many small
-INSERTs against PG during the postprocess phase, each blocking on WAL
-fsync. [update-osm.sh](update-osm.sh) sets
-`ALTER ROLE <user> SET synchronous_commit = off` so commits return as
-soon as the WAL record is in PG memory. Replay is idempotent
-(re-fetched from `osm2pgsql_properties` on crash), so the durability
-trade-off is acceptable for this workload.
-
-
 ## Storage layout
 
 | Path                  | Backing                                   | Purpose                                          |
@@ -237,15 +203,6 @@ trade-off is acceptable for this workload.
 `/mnt/data` is ext4 (label `osm-data`), mounted via `/etc/fstab`
 (`LABEL=osm-data … nofail,discard`).
 
-## Sizing
-
-| Component          | Initial import           | Steady-state daily      |
-| ------------------ | ------------------------ | ----------------------- |
-| VM                 | E32-8s_v5 (current)      | E16s_v5 (resize down)   |
-| VM data disk       | 256+ GiB Premium SSD     | 64-128 GiB Premium SSD  |
-| PG SKU             | D16ds_v5                 | D16ds_v5                |
-| PG storage         | P30 (~5,000 IOPS)        | P40 for planet          |
-
 PG `max_connections=200`. **The VM, the PG Flex Server, and the blob
 storage account must all be in the same Azure region** — cross-region
 latency on every libpq round-trip and every blob read defeats the
@@ -257,9 +214,9 @@ performance numbers in this document.
 | -------------------------------- | ---------- | ------------------- |
 | VM E32-8s_v5                     | ~$1,400    | ~$60                |
 | VM data disk 256 GiB Premium     | ~$40       | ~$40                |
-| PG D16ds_v5 + P30 storage        | ~$950      | ~$950               |
+| PG D8ds_v5 + P40 storage         | ~$650      | ~$650               |
 | Log Analytics + bandwidth        | <$20       | <$20                |
-| **Total (Germany)**              | **~$2,400**| **~$1,100**         |
+| **Total**                        | **~$2,100**| **~$800**           |
 
 Scheduled column assumes the VM is deallocated outside a ~1 h daily
 window (start → update → deallocate). The Premium SSD keeps
@@ -290,13 +247,13 @@ JIT NSG, PE NICs, Malware Scanning tags) — intentionally not in Bicep.
 
 Single Germany replication day (~5-6 MB diff), end-to-end
 `update-osm.sh` wall time, on the current sizing
-(E32-8s_v5, Premium SSD v2 750 MB/s, PG **D16ds_v5 + P30 throughout**,
+(E32-8s_v5, Premium SSD v2 750 MB/s, PG **D8ds_v5 + P30 throughout**,
 tuned `max_wal_size` + `max_parallel_maintenance_workers`,
 `synchronous_commit=off`):
 
 | Operation                                       | Germany (measured) |
 | ----------------------------------------------- | ------------------ |
-| Initial load (`init-osm.sh`)                    | **~20 min**        |
+| Initial load (`init-osm.sh`)                    | **~30 min**        |
 | Warm-up (`vmtouch -t nodes.bin`, ~50 GB)        | **~1 min**         |
 | One day of replication (`update-osm.sh`, warm)  | **~120 s**         |
 | 5 days catch-up (warm)                          | **~7 min**         |
@@ -305,46 +262,51 @@ tuned `max_wal_size` + `max_parallel_maintenance_workers`,
 | One day, cold cache, NFS (Azure Files) — old    | aborted            |
 | One day, Container Apps Job, NFS                | unstable — see *Why VM* |
 
-Same dimensions extrapolated to planet sizing (E64s_v5 / 1200 MB/s,
-PG D32ds_v5 + P40 throughout) — see
-[Scaling to planet](#scaling-to-planet) for the full sizing rationale:
-
-| Operation                                       | Planet (estimated) |
-| ----------------------------------------------- | ------------------ |
-| Initial load                                    | **8-12 h**         |
-| Warm-up (`vmtouch -t nodes.bin`, ~110 GB)       | **~90 s**          |
-| One day of replication (warm)                   | **~60 min**        |
-| 5 days catch-up (warm)                          | **~5 h**           |
-| One day, cold cache                             | many hours         |
+Planet numbers on the same architecture (E32-8s_v5 VM, Premium SSD v2,
+PG **D8ds_v5 + P40 throughout**) are captured below from an actual
+run — see [Planet, measured (2026-07)](#planet-measured-2026-07).
 
 ### Planet, measured (2026-07)
 
 Actual numbers from a full-planet build against the same architecture,
-with PG scaled **down** to `D8ds_v5` (8 vCore / 32 GiB) on P40 storage
-for steady-state updates, and the VM at `E32-8s_v5`:
+with PG at `D8ds_v5` (8 vCore / 32 GiB) on P40 storage for **both**
+initial load and steady-state updates, and the VM at `E32-8s_v5`:
 
-| Operation                                       | Planet (measured, D8ds_v5 PG) |
-| ----------------------------------------------- | ----------------------------- |
-| Initial load (`init-osm.sh`) on **D16ds_v5** PG | **~13 h**                     |
-| Initial load extrapolated to D8ds_v5 PG         | ~14-16 h                      |
-| One day of replication (warm) on **D8ds_v5** PG | **~30 min**                   |
-| Warm-up (`vmtouch -t nodes.bin`, ~112 GiB)      | **~12 s** (from OS page cache)|
+| Operation                                                | Planet (measured, D8ds_v5 PG)     |
+| -------------------------------------------------------- | --------------------------------- |
+| **Initial load (`init-osm.sh`) on D8ds_v5 PG**           | **~13–14 h**                      |
+|   ├─ Reading input files (nodes + ways + relations)      | 8 h 18 m                          |
+|   │   ├─ 10.73 B nodes                                    | 16 m (~11.0 M/s)                  |
+|   │   ├─ 1.20 B ways                                      | 2 h 26 m (~137 k/s)               |
+|   │   └─ 14.54 M relations                                | 5 h 36 m (~721 /s)                |
+|   └─ Postprocessing (cluster + geom/osm_id indexes + ANALYZE) | ~4–5 h (polygon is the long tail) |
+| One day of replication (warm) on D8ds_v5 PG              | **~30 min**                       |
+| Warm-up (`vmtouch -t nodes.bin`, ~112 GiB)               | **~12 s** (from OS page cache)    |
+
+Run captured 2026-07-16 (`planet-latest.osm.pbf`, osm2pgsql 1.11.0,
+PostGIS 3.6 on PostgreSQL 17.10). Full log preserved in
+`~/osm-work/init-osm.log` on the VM.
 
 Notes:
-- Init on `D16ds_v5` PG showed sustained PG CPU ≈ 15% and RAM ≈ 30%.
-  P40 storage (7,500 IOPS / 250 MB/s) is the actual bottleneck, so
-  D16 vs D8 mostly matters for the CREATE INDEX phase only. `D8ds_v5`
-  VM I/O caps (12,800 IOPS / 288 MB/s uncached) still exceed P40's
-  ceiling, so the COPY phase runs at the same speed on either SKU.
-- Recommended pattern: bump PG to `D16ds_v5` for init only via
-  `az postgres flexible-server update` (online, ~1-2 min restart),
-  then scale back to `D8ds_v5` for daily updates to halve steady-state
-  compute cost.
+- **D8ds_v5 handles init directly** — no scale-up-then-down dance is
+  needed. Sustained PG CPU stayed at ≈ 15 % and RAM at ≈ 30 % during
+  the read phase; P40 storage (7,500 IOPS / 250 MB/s) is the actual
+  bottleneck. The four postprocessing tables cluster and index in
+  parallel; `planet_osm_polygon` is the long tail (~3–4 h alone).
+- The `D8ds_v5` VM-side I/O ceiling (12,800 IOPS / 288 MB/s uncached)
+  still exceeds P40's throughput cap, so the COPY phase runs at the
+  same speed as it would on `D16ds_v5`. D16 only helps the parallel
+  `CREATE INDEX` step and shaves ~1–2 h off total wall time — not
+  worth the compute cost for a one-off init.
+- Optional speed-up: bump PG to `D16ds_v5` for init only via
+  `az postgres flexible-server update` (online, ~1–2 min restart),
+  then scale back to `D8ds_v5` for daily updates. Skip this unless
+  init wall time is on the critical path.
 - Each daily update on the planet dataset is roughly one order of
   magnitude larger than the Germany-extract number above because the
-  daily diff itself is ~50-100 MB and the affected geometry set spans
+  daily diff itself is ~50–100 MB and the affected geometry set spans
   the whole planet.
-- Steady-state PG cache-hit ratio at ~93% on 780 GB DB with 8 GiB
+- Steady-state PG cache-hit ratio at ~93 % on 780 GB DB with 8 GiB
   `shared_buffers` — indexes fit in RAM, heap pages spill to P40.
 
 **Takeaway:** for a daily-cron VM that deallocates between runs, the
@@ -378,7 +340,7 @@ Germany numbers and the corresponding planet estimates side-by-side.
 | `/mnt/data` size | 256 GB Premium SSD v2         | **512 GB** Premium SSD v2 (~108 GB nodes.bin + ~80 GB PBF during init + headroom) |
 | `/mnt/data` IOPS | 3000                          | 3000 (still random-read latency-bound, not IOPS-bound) |
 | `/mnt/data` MB/s | 750                           | **1200** (warm-up reads ~110 GB; 1200 MB/s ≈ 90 s)     |
-| PG SKU           | D16ds_v5 (16 vCPU / 64 GB)    | **D32ds_v5** (32 vCPU / 128 GB) for init and daily     |
+| PG SKU           | D8ds_v5 (8 vCPU / 32 GB)      | **D8ds_v5** unchanged — measured OK for planet init and daily (bump to `D16ds_v5` only if init wall time is critical) |
 | PG storage       | P30 (1 TiB / 5,000 IOPS)      | **P40** (2 TB / 7,500 IOPS / 250 MB/s) — capacity-driven |
 | PG params        | `max_wal_size=16384`, `max_parallel_maintenance_workers=4` | Same, plus `max_wal_size=32768` during init |
 
@@ -400,10 +362,14 @@ Germany numbers and the corresponding planet estimates side-by-side.
   not the disk. 3000 IOPS is sufficient.
 - **PG SKU.** `CREATE INDEX` on `planet_osm_*` is the dominant init
   phase, and the pending-ways/relations apply is the dominant update
-  phase — both want PG CPU + RAM. D16ds_v5 (16 cores / 64 GiB RAM,
-  ~16 GiB shared_buffers) brings Germany init to ~20 min and keeps
-  daily updates PG-side hot via OS page cache. For planet, scale up
-  to D32ds_v5 and leave it there — daily diffs are ~20× Germany.
+  phase — both want PG CPU + RAM. The **D8ds_v5** baseline
+  (8 cores / 32 GiB RAM, ~8 GiB shared_buffers) handles Germany init
+  in ~30 min and the full planet in ~13–14 h (see measured numbers
+  above); daily updates stay PG-side hot via OS page cache. P40
+  storage (7,500 IOPS / 250 MB/s) is the actual bottleneck during
+  init, so bumping to D16ds_v5 shaves only ~1–2 h off planet init
+  and is not worth the doubled compute cost for daily runs. Bump PG
+  only if init wall time is on the critical path.
 - **PG storage.** Planet base + indexes ≈ 1.5 TB, so capacity alone
   forces you off P30 — P40 (2 TB) is the natural step up and its
   bundled 7,500 IOPS / 250 MB/s comfortably cover init WAL and daily
