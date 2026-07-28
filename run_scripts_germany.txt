@@ -4,9 +4,15 @@
 
 # 1 Log into the VM
 
-ssh -i ~/osm-vm-key osmadmin@<<your IP>>
+ssh -i ~/osm-vm-key <<your user>>@<<your IP>>
 
-# 2 Persist Germany overrides — inherited by future systemd boot runs too
+# 2 Persist Germany overrides — inherited by future systemd boot runs too.
+#   The sed strips any prior region block (Germany OR world) first, so
+#   /etc/profile.d/osm-env.sh stays clean when you switch back and forth.
+sudo sed -i \
+  -e '/# Geofabrik regional load.*Germany/,/PBF_BLOB_PATH=initial\/germany-latest\.osm\.pbf/d' \
+  -e '/# planet\.openstreetmap\.org.*full planet/,/PBF_BLOB_PATH=initial\/planet-latest\.osm\.pbf/d' \
+  /etc/profile.d/osm-env.sh
 sudo tee -a /etc/profile.d/osm-env.sh >/dev/null <<'EOF'
 
 # Geofabrik regional load — Germany

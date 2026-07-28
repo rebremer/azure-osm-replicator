@@ -1,17 +1,32 @@
 # ─────────────────────────────────────────────────────────────────────
-# World run — full planet from planet.openstreetmap.org (script defaults)
+# World run — full planet from planet.openstreetmap.org
 #
-# No env overrides needed: init-osm.sh / update-osm.sh default to
-#   SOURCE_PBF_URL      = https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf
-#   REPLICATION_SERVER  = https://planet.openstreetmap.org/replication/day/
-#   PBF_BLOB_PATH       = initial/planet-latest.osm.pbf
+# The URLs below match the script defaults; they're written out
+# explicitly so switching *from* a Germany run only requires editing
+# this file, not remembering the defaults.
 # ─────────────────────────────────────────────────────────────────────
 
 # 1 Log into the VM
 
 ssh -i ~/osm-vm-key <<your user>>@<<your IP>>
 
-# 2 Kick off init with RESET_ALL=1 (drops tables, wipes nodes.bin,
+# 2 Persist world overrides — inherited by future systemd boot runs too.
+#   The sed strips any prior region block (Germany OR world) first, so
+#   /etc/profile.d/osm-env.sh stays clean when you switch back and forth.
+sudo sed -i \
+  -e '/# Geofabrik regional load.*Germany/,/PBF_BLOB_PATH=initial\/germany-latest\.osm\.pbf/d' \
+  -e '/# planet\.openstreetmap\.org.*full planet/,/PBF_BLOB_PATH=initial\/planet-latest\.osm\.pbf/d' \
+  /etc/profile.d/osm-env.sh
+sudo tee -a /etc/profile.d/osm-env.sh >/dev/null <<'EOF'
+
+# planet.openstreetmap.org — full planet
+export SOURCE_PBF_URL=https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf
+export REPLICATION_SERVER=https://planet.openstreetmap.org/replication/day/
+export PBF_BLOB_PATH=initial/planet-latest.osm.pbf
+EOF
+. /etc/profile.d/osm-env.sh
+
+# 3 Kick off init with RESET_ALL=1 (drops tables, wipes nodes.bin,
 #   clears replication blobs). RESET_ALL_PBF=1 is redundant on a
 #   freshly deployed / emptied container, but doesn't hurt.
 tmux new -s osm-init '
@@ -24,12 +39,12 @@ tmux new -s osm-init '
 
 tmux attach -t osm-init
 
-# 3 Check if systemd is correctly installed
+# 4 Check if systemd is correctly installed
 
 systemctl is-enabled osm-update-on-boot.service     # enabled
 journalctl -u osm-update-on-boot.service -b --no-pager | tail -20
 
-# 4 Check if state in database corresponds to planet state.txt
+# 5 Check if state in database corresponds to planet state.txt
 
 . /etc/profile.d/osm-env.sh
 export PGPASSWORD=$(curl -fsS -H 'Metadata: true' \
