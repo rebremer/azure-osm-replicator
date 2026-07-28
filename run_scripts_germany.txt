@@ -6,13 +6,20 @@
 
 ssh -i ~/osm-vm-key <<your user>>@<<your IP>>
 
-# 2 Persist Germany overrides — inherited by future systemd boot runs too.
-#   The sed strips any prior region block (Germany OR world) first, so
-#   /etc/profile.d/osm-env.sh stays clean when you switch back and forth.
+# 2 Preflight — osm-update-on-boot.service must be enabled BEFORE running
+#   init or update, otherwise the next VM boot won't pick up replication.
+systemctl is-enabled osm-update-on-boot.service     # expect: enabled
+
+# 3 Strip any prior region block (Germany OR world) from osm-env.sh, so
+#   the file stays clean when you switch back and forth.
 sudo sed -i \
   -e '/# Geofabrik regional load.*Germany/,/PBF_BLOB_PATH=initial\/germany-latest\.osm\.pbf/d' \
   -e '/# planet\.openstreetmap\.org.*full planet/,/PBF_BLOB_PATH=initial\/planet-latest\.osm\.pbf/d' \
   /etc/profile.d/osm-env.sh
+
+cat /etc/profile.d/osm-env.sh
+
+# 4 Persist Germany overrides — inherited by future systemd boot runs too.
 sudo tee -a /etc/profile.d/osm-env.sh >/dev/null <<'EOF'
 
 # Geofabrik regional load — Germany
@@ -22,7 +29,9 @@ export PBF_BLOB_PATH=initial/germany-latest.osm.pbf
 EOF
 . /etc/profile.d/osm-env.sh
 
-# 3 Kick off init with RESET_ALL=1 (drops tables, wipes nodes.bin,
+cat /etc/profile.d/osm-env.sh
+
+# 5 Kick off init with RESET_ALL=1 (drops tables, wipes nodes.bin,
 #   clears replication blobs). RESET_ALL_PBF=1 is redundant on a
 #   freshly deployed / emptied container, but doesn't hurt.
 tmux new -s osm-init '
@@ -35,12 +44,11 @@ tmux new -s osm-init '
 
 tmux attach -t osm-init
 
-# 4 Check if systemd is correctly installed
+# 6 After init: boot VM and confirm osm-update-on-boot.service actually fired on this boot
 
-systemctl is-enabled osm-update-on-boot.service     # enabled
 journalctl -u osm-update-on-boot.service -b --no-pager | tail -20
 
-# 5 Check if state in database corresponds to Geofabrik state.txt
+# 7 Check if state in database corresponds to Geofabrik state.txt
 
 . /etc/profile.d/osm-env.sh
 export PGPASSWORD=$(curl -fsS -H 'Metadata: true' \
