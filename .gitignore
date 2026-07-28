@@ -58,3 +58,5 @@ data/
 # tenant/subscription/VM IPs or paths specific to the operator.
 perf-*.sh
 perf-*/
+
+run_scripts.txt

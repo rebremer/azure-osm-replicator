@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────
+# Germany run — Geofabrik regional extract
+# ─────────────────────────────────────────────────────────────────────
+
+# 1 Log into the VM
+
+ssh -i ~/osm-vm-key osmadmin@<<your IP>>
+
+# 2 Persist Germany overrides — inherited by future systemd boot runs too
+sudo tee -a /etc/profile.d/osm-env.sh >/dev/null <<'EOF'
+
+# Geofabrik regional load — Germany
+export SOURCE_PBF_URL=https://download.geofabrik.de/europe/germany-latest.osm.pbf
+export REPLICATION_SERVER=https://download.geofabrik.de/europe/germany-updates/
+export PBF_BLOB_PATH=initial/germany-latest.osm.pbf
+EOF
+. /etc/profile.d/osm-env.sh
+
+# 3 Kick off init with RESET_ALL=1 (drops tables, wipes nodes.bin,
+#   clears replication blobs). RESET_ALL_PBF=1 is redundant on a
+#   freshly deployed / emptied container, but doesn't hurt.
+tmux new -s osm-init '
+  export RESET_ALL=1
+  export RESET_ALL_PBF=1
+  { ./init-osm.sh
+    echo "=== EXIT $? at $(date -u +%FT%TZ) ==="
+  } 2>&1 | tee -a ~/init-osm-$(date -u +%Y%m%dT%H%M%SZ).log
+'
+
+tmux attach -t osm-init
+
+# 4 Check if systemd is correctly installed
+
+systemctl is-enabled osm-update-on-boot.service     # enabled
+journalctl -u osm-update-on-boot.service -b --no-pager | tail -20
+
+# 5 Check if state in database corresponds to Geofabrik state.txt
+
+. /etc/profile.d/osm-env.sh
+export PGPASSWORD=$(curl -fsS -H 'Metadata: true' \
+  "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://vault.azure.net&client_id=${UAI_CLIENT_ID}" \
+  | jq -r .access_token \
+  | xargs -I{} curl -fsS -H "Authorization: Bearer {}" \
+      "https://${KEY_VAULT_NAME}.vault.azure.net/secrets/${PG_PASSWORD_SECRET_NAME:-pg-admin-password}?api-version=7.4" \
+  | jq -r .value)
+psql -h "$PGHOST" -U "$PGUSER" -d "$PGDATABASE" -c \
+  "SELECT property, value FROM osm2pgsql_properties WHERE property LIKE 'replication_%';"
+
+# Compare with Geofabrik's current head:
+curl -s https://download.geofabrik.de/europe/germany-updates/state.txt

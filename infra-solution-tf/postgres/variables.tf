@@ -24,19 +24,19 @@ variable "postgres_version" {
 }
 
 variable "sku_name" {
-  description = "azurerm PG-flex SKU name, e.g. GP_Standard_D8ds_v5."
+  description = "azurerm PG-flex SKU name, e.g. MO_Standard_E8ds_v5 (Memory-Optimised, 8 vCPU / 64 GB RAM)."
   type        = string
-  default     = "GP_Standard_D8ds_v5"
+  default     = "MO_Standard_E8ds_v5"
 }
 
 variable "storage_mb" {
-  description = "Storage size in MB. 2 TiB = 2097152."
+  description = "Storage size in MB. 1 TiB = 1048576, 2 TiB = 2097152."
   type        = number
-  default     = 2097152
+  default     = 1048576
 }
 
 variable "storage_tier" {
-  description = "Provisioned IOPS tier. P40 corresponds to the 2 TiB size default."
+  description = "Provisioned IOPS tier. P40 = 7 500 IOPS / 250 MB/s. Valid at 1 TiB as an upgrade over the auto-picked P30."
   type        = string
   default     = "P40"
 }

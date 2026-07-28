@@ -166,9 +166,22 @@ az keyvault purge -n <the-kv-name-from-deploy> --location westus3
 ssh osmadmin@<vm-pip>
 export PGHOST=... PGUSER=... PGDATABASE=osm PGPASSWORD='...'
 
-./init-osm.sh        # one-time initial import
+# Kick off the initial import in tmux so you can safely disconnect
+# (planet init runs ~13–14 h; Germany ~30 min):
+tmux new -s osm-init '
+  { ./init-osm.sh
+    echo "=== EXIT $? at $(date -u +%FT%TZ) ==="
+  } 2>&1 | tee -a ~/init-osm-$(date -u +%Y%m%dT%H%M%SZ).log
+'
+# Detach: Ctrl-b d    Reattach: tmux attach -t osm-init
+
 ./update-osm.sh      # daily (wire to systemd timer)
 ```
+
+Copy-paste-ready command sequences for the two supported source
+targets — including SSH, `RESET_ALL=1`, and PG state verification —
+live in [run_scripts_world.txt](run_scripts_world.txt) and
+[run_scripts_germany.txt](run_scripts_germany.txt).
 
 [init-osm.sh](init-osm.sh) downloads the PBF from blob, runs
 `osm2pgsql -c --slim --flat-nodes`, and refuses to overwrite an
