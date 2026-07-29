@@ -101,6 +101,7 @@ module "logs" {
 module "vm" {
   source                 = "../modules/vm"
   vm_name                = var.vm_name
+  vm_size                = var.vm_size
   resource_group_name    = data.azurerm_resource_group.core.name
   location               = var.location
   admin_username         = var.admin_username

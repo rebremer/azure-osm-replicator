@@ -27,6 +27,12 @@ variable "vm_name" {
   default = "osm-import-vm"
 }
 
+variable "vm_size" {
+  description = "VM size. Default is the tested SCSI v5 SKU (README performance numbers rely on this). Override to a v6 SKU (e.g. Standard_E32bs_v6) to exercise the NVMe data-disk detection path in cloud-init.yaml."
+  type        = string
+  default     = "Standard_E32-8s_v5"
+}
+
 variable "admin_username" {
   type    = string
   default = "osmadmin"

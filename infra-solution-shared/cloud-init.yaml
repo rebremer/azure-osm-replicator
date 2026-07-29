@@ -160,16 +160,22 @@ runcmd:
   #      (nvme0n1 / sda) and any device that already has a filesystem
   #      or mountpoint, so re-running cloud-init on a healthy VM is a
   #      no-op instead of nuking data.
-  - bash -c 'set -e
+  - |
+    bash -c '
+      set -e
       DEV=$(readlink -f /dev/disk/azure/scsi1/lun0 2>/dev/null || true)
       if [ -z "$DEV" ] || [ ! -b "$DEV" ]; then
           DEV=$(lsblk -dnbo NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT \
                 | awk "\$3==\"disk\" && \$4==\"\" && \$5==\"\" && \$1!~/^nvme0n1$|^sda$/ {print \"/dev/\"\$1; exit}")
       fi
-      [ -n "$DEV" ] && [ -b "$DEV" ] || { echo "cloud-init: no data disk found — /mnt/data will not be a real mount" >&2; exit 1; }
+      if [ -z "$DEV" ] || [ ! -b "$DEV" ]; then
+          echo "no data disk found - /mnt/data will not be a real mount" >&2
+          exit 1
+      fi
       if ! blkid "$DEV" >/dev/null 2>&1; then
           mkfs.ext4 -F -L osm-data "$DEV"
-      fi'
+      fi
+    '
   - mkdir -p /mnt/data
   - bash -c 'grep -q "/mnt/data" /etc/fstab || echo "LABEL=osm-data /mnt/data ext4 defaults,nofail,discard 0 2" >> /etc/fstab'
   - mount -a

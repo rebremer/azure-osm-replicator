@@ -7,6 +7,7 @@ using 'main.bicep'
 param prefix      = 'osm-updater'
 param location    = readEnvironmentVariable('LOCATION', 'westus3')
 param vmName      = 'osm-import-vm'
+param vmSize      = readEnvironmentVariable('VM_SIZE', 'Standard_E32-8s_v5')
 param adminUsername = 'osmadmin'
 
 // ── Auth mode ─────────────────────────────────────────────────────────

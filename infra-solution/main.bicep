@@ -44,6 +44,9 @@ param location string = resourceGroup().location
 @description('VM name.')
 param vmName string = 'osm-import-vm'
 
+@description('VM size. Default is the tested SCSI v5 SKU (README performance numbers rely on this). Override to a v6 SKU (e.g. Standard_E32bs_v6) to exercise the NVMe data-disk detection path in cloud-init.yaml.')
+param vmSize string = 'Standard_E32-8s_v5'
+
 @description('VM admin username.')
 param adminUsername string = 'osmadmin'
 
@@ -212,6 +215,7 @@ module vm 'modules/vm.bicep' = {
   name: 'vm'
   params: {
     vmName: vmName
+    vmSize: vmSize
     location: location
     adminUsername: adminUsername
     adminPassword: adminPassword
