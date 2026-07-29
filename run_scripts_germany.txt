@@ -62,3 +62,48 @@ psql -h "$PGHOST" -U "$PGUSER" -d "$PGDATABASE" -c \
 
 # Compare with Geofabrik's current head:
 curl -s https://download.geofabrik.de/europe/germany-updates/state.txt
+
+# 8 (Continuously-running VMs) Install / refresh a daily timer that reuses
+#   osm-update-on-boot.service. Change TIMER_TIME below and re-paste this
+#   whole block — idempotent for both create and update. Systemd
+#   guarantees the unit is exclusive, so an accidental boot at the same
+#   time does not double-run.
+TIMER_TIME="10:45"
+
+sudo tee /etc/systemd/system/osm-update-daily.timer >/dev/null <<EOF
+[Unit]
+Description=Daily OSM replication update at ${TIMER_TIME} Europe/Berlin
+
+[Timer]
+# CET/CEST-aware — tzdata handles the twice-yearly DST shift automatically.
+OnCalendar=*-*-* ${TIMER_TIME}:00 Europe/Berlin
+# Fires at next boot if the VM was offline at ${TIMER_TIME} (e.g. stop/start
+# cycle spanning that time).
+Persistent=true
+Unit=osm-update-on-boot.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable osm-update-daily.timer    # no-op if already enabled
+sudo systemctl restart osm-update-daily.timer   # picks up the new OnCalendar
+
+# Verify
+systemctl list-timers osm-update-daily.timer --all
+systemctl is-enabled osm-update-daily.timer   # expect: enabled
+systemctl is-active  osm-update-daily.timer   # expect: active
+
+journalctl -u osm-update-daily.timer --since today --no-pager
+
+# 9 See if update-osm.sh is running right now, and follow its output
+
+# Running? 'activating' = in progress, 'inactive' = finished (or not yet fired)
+systemctl is-active osm-update-on-boot.service
+
+# Live tail of the current / most recent run
+journalctl -u osm-update-on-boot.service -f
+
+# Last-run summary + exit code (Ctrl-C out of the tail first)
+systemctl status osm-update-on-boot.service --no-pager
