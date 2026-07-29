@@ -149,8 +149,27 @@ runcmd:
   - su - osmadmin -c 'az config set extension.use_dynamic_install=yes_without_prompt'
   - su - osmadmin -c 'az extension add --name storage-blob-preview --yes --only-show-errors'
 
-  # Format and mount the data disk (LUN 0 → /dev/disk/azure/scsi1/lun0)
-  - bash -c 'set -e; DEV=$(readlink -f /dev/disk/azure/scsi1/lun0); if ! blkid "$DEV" >/dev/null 2>&1; then mkfs.ext4 -F -L osm-data "$DEV"; fi'
+  # Format and mount the data disk.
+  # Works on both SCSI-based VM families (Ebs_v5, E*ds_v5 etc. — data disk
+  # appears under /dev/disk/azure/scsi1/lun0) and NVMe-based families
+  # (Ebs_v5 memory-optimised, Eb*_v6 etc. — no /dev/disk/azure/scsi1/
+  # symlink, disk shows up as /dev/nvme0nN). Detection order:
+  #   1. Prefer the well-known SCSI symlink at LUN 0 when present.
+  #   2. Otherwise pick the first non-root, unformatted, unmounted whole
+  #      disk (nvme0n[2-9] on NVMe VMs). Filter excludes the OS disk
+  #      (nvme0n1 / sda) and any device that already has a filesystem
+  #      or mountpoint, so re-running cloud-init on a healthy VM is a
+  #      no-op instead of nuking data.
+  - bash -c 'set -e
+      DEV=$(readlink -f /dev/disk/azure/scsi1/lun0 2>/dev/null || true)
+      if [ -z "$DEV" ] || [ ! -b "$DEV" ]; then
+          DEV=$(lsblk -dnbo NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT \
+                | awk "\$3==\"disk\" && \$4==\"\" && \$5==\"\" && \$1!~/^nvme0n1$|^sda$/ {print \"/dev/\"\$1; exit}")
+      fi
+      [ -n "$DEV" ] && [ -b "$DEV" ] || { echo "cloud-init: no data disk found — /mnt/data will not be a real mount" >&2; exit 1; }
+      if ! blkid "$DEV" >/dev/null 2>&1; then
+          mkfs.ext4 -F -L osm-data "$DEV"
+      fi'
   - mkdir -p /mnt/data
   - bash -c 'grep -q "/mnt/data" /etc/fstab || echo "LABEL=osm-data /mnt/data ext4 defaults,nofail,discard 0 2" >> /etc/fstab'
   - mount -a
