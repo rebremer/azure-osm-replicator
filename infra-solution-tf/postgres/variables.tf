@@ -32,7 +32,7 @@ variable "sku_name" {
 variable "storage_mb" {
   description = "Storage size in MB. 1 TiB = 1048576, 2 TiB = 2097152."
   type        = number
-  default     = 1048576
+  default     = 2097152
 }
 
 variable "storage_tier" {
